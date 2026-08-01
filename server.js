@@ -2,208 +2,537 @@ const express = require('express');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 const app = express();
-const GHL_API = 'https://services.leadconnectorhq.com';
-const HP_BASE = 'https://api.handypay.me/api/v1';
 
-app.use('/api/webhooks', express.raw({ type: 'application/json' }));
+// PASTE CHECK: if copied from chat, verify GHL_API, GHL_CLIENT_ID, GHL_CLIENT_SECRET are NOT corrupted
+const GHL_API = 'https://services.leadconnectorhq.com';
+const GHL_CLIENT_ID = process.env.GHL_CLIENT_ID;
+const GHL_CLIENT_SECRET = process.env.GHL_CLIENT_SECRET;
+const HP_BASE = 'https://api.handypay.me/api/v1';
+const APP_URL = process.env.APP_URL || 'https://handypay-deposits-app.vercel.app';
+const LOGO_URL = 'https://storage.googleapis.com/crm-conversations-ai-production/ask-ai-images/1785549533996/aaf88bbe-7f89-44b6-ba1b-12a6417755f6.png';
+
+app.use('/api/webhooks', express.raw({ type: '*/*' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
-const LOGO_URL = 'https://storage.googleapis.com/crm-conversations-ai-production/ask-ai-images/1785549533996/aaf88bbe-7f89-44b6-ba1b-12a6417755f6.png';
 
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'HandyPay Deposits v1.0' }));
+// ============================================================
+// HEALTH
+// ============================================================
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'HandyPay Deposits v2.0' }));
 app.get('/api/health', (req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }));
 app.get('/api/logo', (req, res) => res.redirect(LOGO_URL));
 
+// ============================================================
+// DB HELPERS
+// ============================================================
+async function getMerchantConfig(locationId) {
+  const { rows } = await pool.query('SELECT * FROM merchant_configs WHERE location_id=$1', [locationId]);
+  return rows[0] || null;
+}
+async function getPaymentLogBySession(sessionId) {
+  const { rows } = await pool.query('SELECT * FROM payment_logs WHERE session_id=$1', [sessionId]);
+  return rows[0] || null;
+}
+async function updatePaymentLogStatus(sessionId, status) {
+  await pool.query('UPDATE payment_logs SET status=$1, updated_at=NOW() WHERE session_id=$2', [status, sessionId]);
+}
+
+// ============================================================
+// CRM HELPERS
+// ============================================================
+async function getContact(accessToken, contactId) {
+  const r = await fetch(GHL_API + '/contacts/' + contactId, {
+    headers: { 'Authorization': 'Bearer ' + accessToken, 'Version': '2021-07-28' }
+  });
+  if (!r.ok) throw new Error('getContact ' + r.status);
+  const d = await r.json();
+  return d.contact || d;
+}
+
+async function refreshCrmToken(locationId) {
+  const cfg = await getMerchantConfig(locationId);
+  if (!cfg || !cfg.crm_refresh_token) throw new Error('No refresh token');
+  const r = await fetch(GHL_API + '/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: GHL_CLIENT_ID, client_secret: GHL_CLIENT_SECRET,
+      grant_type: 'refresh_token', refresh_token: cfg.crm_refresh_token
+    })
+  });
+  if (!r.ok) throw new Error('Token refresh ' + r.status);
+  const data = await r.json();
+  await pool.query(
+    'UPDATE merchant_configs SET crm_access_token=$1, crm_refresh_token=$2, updated_at=NOW() WHERE location_id=$3',
+    [data.access_token, data.refresh_token, locationId]
+  );
+  return data.access_token;
+}
+
+async function sendSms(accessToken, locationId, contactId, message) {
+  let conversationId;
+  const sr = await fetch(GHL_API + '/conversations/search?contactId=' + contactId + '&locationId=' + locationId, {
+    headers: { 'Authorization': 'Bearer ' + accessToken, 'Version': '2021-04-15' }
+  });
+  if (sr.ok) {
+    const sd = await sr.json();
+    conversationId = sd.conversations && sd.conversations[0] && sd.conversations[0].id;
+  }
+  if (!conversationId) {
+    const cr = await fetch(GHL_API + '/conversations/', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-04-15' },
+      body: JSON.stringify({ contactId: contactId, locationId: locationId })
+    });
+    const cd = await cr.json();
+    conversationId = (cd.conversation && cd.conversation.id) || cd.id;
+  }
+  if (!conversationId) throw new Error('Could not get/create conversation');
+  const mr = await fetch(GHL_API + '/conversations/messages', {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-04-15' },
+    body: JSON.stringify({ type: 'SMS', message: message, conversationId: conversationId })
+  });
+  if (!mr.ok) {
+    const errText = await mr.text();
+    throw new Error('SMS send ' + mr.status + ' ' + errText);
+  }
+  return mr.json();
+}
+
+async function addContactTag(accessToken, contactId, tags) {
+  const r = await fetch(GHL_API + '/contacts/' + contactId + '/tags', {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
+    body: JSON.stringify({ tags: tags })
+  });
+  if (!r.ok) console.error('[tag] failed:', r.status);
+  return r.json().catch(function() {});
+}
+
+async function addContactNote(accessToken, contactId, body) {
+  const r = await fetch(GHL_API + '/contacts/' + contactId + '/notes', {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
+    body: JSON.stringify({ body: body })
+  });
+  if (!r.ok) console.error('[note] failed:', r.status);
+  return r.json().catch(function() {});
+}
+
+// ============================================================
+// HANDYPAY HELPERS
+// ============================================================
+async function createHandyPaySession(apiKey, opts) {
+  var amount = opts.amount, currency = opts.currency, contact = opts.contact || {},
+      metadata = opts.metadata || {}, successUrl = opts.successUrl, cancelUrl = opts.cancelUrl;
+  var payload = {
+    amount: amount,
+    currency: currency || 'JMD',
+    success_url: successUrl,
+    cancel_url: cancelUrl,
+    metadata: metadata
+  };
+  if (contact.email) payload.customer_email = contact.email;
+  if (contact.name) payload.customer_name = contact.name;
+  var r = await fetch(HP_BASE + '/payment-sessions', {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  var text = await r.text();
+  if (!r.ok) throw new Error('HandyPay session ' + r.status + ': ' + text);
+  return JSON.parse(text);
+}
+
+// ============================================================
+// PAYMENT PROVIDER REGISTRATION
+// ============================================================
 async function registerPaymentProvider(locationId, accessToken) {
   try {
-    const r = await fetch(GHL_API + '/payments/custom-provider/provider?locationId=' + locationId, {
+    var r = await fetch(GHL_API + '/payments/custom-provider/provider?locationId=' + locationId, {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
-      body: JSON.stringify({ name: 'HandyPay Deposits', description: 'Collect booking deposits automatically. Clients get an SMS payment link when they book.', paymentsUrl: process.env.APP_URL + '/api/pay', queryUrl: process.env.APP_URL + '/api/query', imageUrl: LOGO_URL, supportsSubscriptionSchedule: false })
+      body: JSON.stringify({
+        name: 'HandyPay Deposits',
+        description: 'Collect booking deposits automatically via SMS payment link.',
+        paymentsUrl: APP_URL + '/api/pay',
+        queryUrl: APP_URL + '/api/query',
+        imageUrl: LOGO_URL,
+        supportsSubscriptionSchedule: false
+      })
     });
-    const d = await r.json();
-    console.log('[register]', locationId, r.status, JSON.stringify(d).substring(0,300));
+    var d = await r.json();
+    console.log('[register]', locationId, r.status, JSON.stringify(d).substring(0, 200));
     return d;
-  } catch (e) { console.error('[register] error:', e.message); }
+  } catch (e) { console.error('[register]', e.message); }
 }
 
 async function activatePaymentModes(locationId, accessToken, apiKey, mode) {
-  const isLive = mode === 'live';
-  const key = apiKey || 'hp_pending_setup';
+  var key = apiKey || 'hp_pending_setup';
   try {
-    const r = await fetch(GHL_API + '/payments/custom-provider/connect?locationId=' + locationId, {
+    var r = await fetch(GHL_API + '/payments/custom-provider/connect?locationId=' + locationId, {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
-      body: JSON.stringify({ locationId, live: { apiKey: key, publishableKey: key, liveMode: isLive }, test: { apiKey: key, publishableKey: key, liveMode: !isLive } })
+      body: JSON.stringify({
+        locationId: locationId,
+        live: { apiKey: key, publishableKey: key, liveMode: mode === 'live' },
+        test: { apiKey: key, publishableKey: key, liveMode: false }
+      })
     });
-    const d = await r.json();
-    console.log('[activate]', locationId, mode, r.status, JSON.stringify(d).substring(0,300));
+    var d = await r.json();
+    console.log('[activate]', locationId, mode, r.status, JSON.stringify(d).substring(0, 200));
     return d;
-  } catch (e) { console.error('[activate] error:', e.message); }
+  } catch (e) { console.error('[activate]', e.message); }
 }
 
+// ============================================================
+// OAUTH CALLBACK
+// ============================================================
 app.get('/api/oauth/callback', async (req, res) => {
-  const { code } = req.query;
+  var code = req.query.code;
   if (!code) return res.status(400).send('Missing code');
   try {
-    const t = await fetch(GHL_API + '/oauth/token', {
+    var t = await fetch(GHL_API + '/oauth/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ client_id: process.env.GHL_CLIENT_ID, client_secret: process.env.GHL_CLIENT_SECRET, grant_type: 'authorization_code', code, redirect_uri: process.env.APP_URL + '/api/oauth/callback' })
+      body: new URLSearchParams({
+        client_id: GHL_CLIENT_ID, client_secret: GHL_CLIENT_SECRET,
+        grant_type: 'authorization_code', code: code,
+        redirect_uri: APP_URL + '/api/oauth/callback'
+      })
     });
-    const tokens = await t.json();
-    console.log('OAuth response:', JSON.stringify({ keys: Object.keys(tokens), userType: tokens.userType, locationId: tokens.locationId, companyId: tokens.companyId, hasToken: !!tokens.access_token }));
+    var tokens = await t.json();
     if (!tokens.access_token) return res.status(400).send('Token error: ' + JSON.stringify(tokens));
-    const locationId = tokens.locationId || null;
-    if (!locationId) {
-      console.error('Company-level token received - no locationId. userType:', tokens.userType);
-      return res.send('<html><head><title>HandyPay Deposits</title><style>body{font-family:sans-serif;max-width:600px;margin:60px auto;padding:20px;text-align:center}h2{color:#D10039}p{color:#444}.note{color:#888;font-size:12px;margin-top:20px}</style></head><body><h2>Sub-Account Install Required</h2><p>HandyPay Deposits must be installed <strong>per sub-account</strong>, not at the agency level.</p><p>Please use the sub-account install link provided by L-NET, or contact support.</p><p class="note">Debug: userType=' + tokens.userType + ' | companyId=' + tokens.companyId + '</p></body></html>');
-    }
-    await pool.query('INSERT INTO merchant_configs (location_id,crm_access_token,crm_refresh_token) VALUES ($1,$2,$3) ON CONFLICT (location_id) DO UPDATE SET crm_access_token=$2,crm_refresh_token=$3,updated_at=NOW()', [locationId, tokens.access_token, tokens.refresh_token]);
+    var locationId = tokens.locationId;
+    if (!locationId) return res.send('<h2>Sub-Account Install Required</h2><p>Install per sub-account, not at agency level.</p>');
+    await pool.query(
+      'INSERT INTO merchant_configs (location_id,crm_access_token,crm_refresh_token) VALUES ($1,$2,$3) ON CONFLICT (location_id) DO UPDATE SET crm_access_token=$2,crm_refresh_token=$3,updated_at=NOW()',
+      [locationId, tokens.access_token, tokens.refresh_token]
+    );
     await registerPaymentProvider(locationId, tokens.access_token);
     await activatePaymentModes(locationId, tokens.access_token, 'hp_pending_setup', 'test');
     res.redirect('/api/settings?location_id=' + locationId + '&installed=true');
-  } catch (err) {
-    res.status(500).send('OAuth error: ' + err.message);
-  }
+  } catch (err) { res.status(500).send('OAuth error: ' + err.message); }
 });
 
+// ============================================================
+// SETTINGS
+// ============================================================
 app.get('/api/settings', async (req, res) => {
-  let { location_id } = req.query;
-  // Auto-detect location_id if missing from URL (CRM template var may be empty)
+  var location_id = req.query.location_id;
   if (!location_id) {
-    return res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HandyPay Settings</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#f4f6fb;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}.card{background:#fff;border-radius:14px;box-shadow:0 4px 24px rgba(0,0,0,.09);max-width:440px;width:100%;padding:36px}.logo{display:flex;align-items:center;gap:12px;margin-bottom:24px}.logo img{width:44px;height:44px;border-radius:10px}.logo h1{font-size:18px;font-weight:800;color:#005DBD}p{font-size:14px;color:#555;margin-bottom:20px;line-height:1.5}label{display:block;font-size:13px;font-weight:700;color:#333;margin-bottom:6px}input{width:100%;border:1.5px solid #e0e0e0;border-radius:8px;padding:10px 14px;font-size:14px;outline:none;margin-bottom:16px}input:focus{border-color:#005DBD}.btn{width:100%;background:#D10039;color:#fff;border:none;border-radius:9px;padding:13px;font-size:15px;font-weight:700;cursor:pointer}#status{font-size:12px;color:#888;text-align:center;margin-top:12px}</style></head><body><div class="card"><div class="logo"><img src="/api/logo" alt="HP"><div><h1>HandyPay Settings</h1></div></div><p id="msg">Detecting your sub-account...</p><form id="form" style="display:none"><label>Sub-Account Location ID</label><input id="lid" placeholder="e.g. tPCmng9TJ7Qc6gG7AaU3" autocomplete="off"><button class="btn" type="submit">Open Settings</button></form><div id="status"></div></div><script>var detected=false;function go(id){if(detected)return;detected=true;localStorage.setItem('hp_location_id',id);window.location.href='/api/settings?location_id='+id;}var saved=localStorage.getItem('hp_location_id');if(saved){document.getElementById('msg').textContent='Loading your settings...';setTimeout(function(){go(saved);},300);}window.addEventListener('message',function(e){if(detected)return;var d=e.data||{};var id=d.locationId||d.location_id||(d.data&&(d.data.locationId||d.data.location_id));if(id){document.getElementById('msg').textContent='Found sub-account, loading...';go(id);}});try{window.parent.postMessage({type:'REQUEST_LOCATION',source:'handypay-deposits'},'\'*\'');}catch(e){}setTimeout(function(){if(!detected){document.getElementById('msg').textContent='Enter your sub-account Location ID to continue:';document.getElementById('form').style.display='block';}},2500);document.getElementById('form').addEventListener('submit',function(ev){ev.preventDefault();var v=document.getElementById('lid').value.trim();if(v)go(v);});<\/script></body></html>`);
+    res.setHeader('Content-Type', 'text/html');
+    return res.send('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>HandyPay Settings</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f4f6fb;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}.card{background:#fff;border-radius:14px;box-shadow:0 4px 24px rgba(0,0,0,.09);max-width:440px;width:100%;padding:36px}h1{font-size:18px;font-weight:800;color:#005DBD;margin-bottom:16px}p{font-size:14px;color:#555;margin-bottom:20px}label{display:block;font-size:13px;font-weight:700;color:#333;margin-bottom:6px}input{width:100%;border:1.5px solid #e0e0e0;border-radius:8px;padding:10px 14px;font-size:14px;outline:none;margin-bottom:16px}.btn{width:100%;background:#D10039;color:#fff;border:none;border-radius:9px;padding:13px;font-size:15px;font-weight:700;cursor:pointer}</style></head><body><div class="card"><h1>HandyPay Settings</h1><p id="msg">Detecting your sub-account...</p><form id="form" style="display:none"><label>Location ID</label><input id="lid" placeholder="e.g. tPCmng9TJ7Qc6gG7AaU3"><button class="btn" type="submit">Open Settings</button></form><script>var ok=false;function go(id){if(ok)return;ok=true;localStorage.setItem("hp_lid",id);location.href="/api/settings?location_id="+id;}var s=localStorage.getItem("hp_lid");if(s){document.getElementById("msg").textContent="Loading...";setTimeout(function(){go(s);},300);}window.addEventListener("message",function(e){var d=e.data||{};var id=d.locationId||d.location_id;if(id)go(id);});try{window.parent.postMessage({type:"REQUEST_LOCATION",source:"handypay-deposits"},"*");}catch(e){}setTimeout(function(){if(!ok){document.getElementById("msg").textContent="Enter your Location ID:";document.getElementById("form").style.display="block";}},2500);document.getElementById("form").addEventListener("submit",function(e){e.preventDefault();var v=document.getElementById("lid").value.trim();if(v)go(v);})</script></div></body></html>');
   }
-  let c = {};
-  try { const { rows } = await pool.query('SELECT * FROM merchant_configs WHERE location_id=$1', [location_id]); if (rows.length) c = rows[0]; } catch(e){}
-  const msg = req.query.installed ? 'App installed! Enter your HandyPay API key below to activate deposits.' : req.query.saved ? 'Settings saved! HandyPay is now connected.' : '';
-  const isConn = !!c.handypay_api_key && c.handypay_api_key !== 'hp_pending_setup';
-  const masked = isConn ? c.handypay_api_key.slice(0,14) + '...' + c.handypay_api_key.slice(-4) : '';
-  const curMode = c.mode || 'test';
-  res.send('<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HandyPay Deposits</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#f4f6fb;padding:24px}.card{background:#fff;border-radius:14px;box-shadow:0 4px 24px rgba(0,0,0,.09);max-width:560px;margin:0 auto;padding:40px}.hdr{display:flex;align-items:center;gap:14px;margin-bottom:24px;padding-bottom:20px;border-bottom:1px solid #f0f0f0}.hdr img{width:48px;height:48px;border-radius:10px}.hdr h1{font-size:20px;font-weight:800;color:#005DBD}.hdr span{font-size:12px;color:#999}.ok{background:#e8f5e9;border:1px solid #a5d6a7;color:#2e7d32;padding:12px 16px;border-radius:8px;font-size:14px;margin-bottom:20px}.badge{background:#e3f2fd;border:1px solid #90caf9;color:#1565c0;padding:8px 14px;border-radius:8px;font-size:13px;margin-bottom:18px}label{display:block;font-size:13px;font-weight:700;color:#333;margin-top:16px;margin-bottom:5px}input,select{width:100%;border:1.5px solid #e0e0e0;border-radius:8px;padding:10px 14px;font-size:14px;color:#222;outline:none}.hr{border:none;border-top:1px solid #f0f0f0;margin:20px 0}.chk-row{display:flex;align-items:flex-start;gap:12px;margin-top:16px;padding:14px;background:#f8f9ff;border-radius:10px;border:1px solid #e0e8ff}.chk-row input[type=checkbox]{width:18px;height:18px;margin-top:2px;accent-color:#005DBD;flex-shrink:0}.chk-row div label{font-size:14px;font-weight:700;margin:0;cursor:pointer}.chk-row div p{font-size:12px;color:#888;margin-top:3px}.btn{width:100%;margin-top:24px;background:#D10039;color:#fff;border:none;border-radius:9px;padding:14px;font-size:15px;font-weight:700;cursor:pointer}.foot{margin-top:16px;text-align:center;font-size:11px;color:#ccc}</style></head><body><div class="card"><div class="hdr"><img src="' + process.env.APP_URL + '/api/logo" alt="HandyPay"><div><h1>HandyPay Deposits</h1><span>Payment Integration Settings</span></div></div>' + (msg ? '<div class="ok">' + msg + '</div>' : '') + (isConn ? '<div class="badge">Connected | Key: <code>' + masked + '</code> | Mode: <strong>' + curMode.toUpperCase() + '</strong></div>' : '') + '<form method="POST" action="/api/settings"><input type="hidden" name="location_id" value="' + location_id + '"><label>HandyPay API Key *</label><input type="text" name="handypay_api_key" value="' + (isConn ? c.handypay_api_key : '') + '" placeholder="' + (curMode === 'live' ? 'hp_live_...' : 'hp_test_...') + '" required autocomplete="off"><label>Payment Mode</label><select name="mode"><option value="test"' + (curMode !== 'live' ? ' selected' : '') + '>&#x1F9EA; Test Mode (hp_test_... keys)</option><option value="live"' + (curMode === 'live' ? ' selected' : '') + '>&#x1F534; Live Mode (hp_live_... keys)</option></select><div class="hr"></div><label>Deposit Amount (JMD)</label><input type="number" name="deposit_amount" value="' + (c.deposit_amount || 5000) + '" min="100" step="100"><label>Type</label><select name="deposit_type"><option value="fixed">Fixed</option><option value="percentage">Percentage</option></select><label>Success URL <span style="font-weight:normal;color:#aaa">(optional)</span></label><input type="text" name="success_url" value="' + (c.success_url || '') + '" placeholder="https://yourdomain.com/thank-you"><label>Cancel URL <span style="font-weight:normal;color:#aaa">(optional)</span></label><input type="text" name="cancel_url" value="' + (c.cancel_url || '') + '" placeholder="https://yourdomain.com/cancelled"><div class="hr"></div><div class="chk-row"><input type="checkbox" name="set_default" id="sd" value="1"><div><label for="sd">Set as Default Payment Provider</label><p>Make HandyPay the primary provider for calendar bookings and online payments</p></div></div><button type="submit" class="btn">Save &amp; Connect HandyPay</button></form><div class="foot">HandyPay Deposits v1.0 &middot; L-NET Smart Technologies</div></div></body></html>');
+  var c = {};
+  try {
+    var rows = (await pool.query('SELECT * FROM merchant_configs WHERE location_id=$1', [location_id])).rows;
+    if (rows.length) c = rows[0];
+  } catch (e) {}
+  var msg = req.query.installed ? 'App installed! Enter your HandyPay API key to activate deposits.' : req.query.saved ? 'Settings saved. Deposits active.' : '';
+  var isConn = c.handypay_api_key && c.handypay_api_key !== 'hp_pending_setup';
+  var masked = isConn ? c.handypay_api_key.slice(0,14) + '...' + c.handypay_api_key.slice(-4) : '';
+  var dep = c.deposit_amount || 5000;
+  var curMode = c.mode || 'test';
+  res.setHeader('Content-Type', 'text/html');
+  res.send('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>HandyPay Deposits</title>'
+    + '<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f4f6fb;padding:24px}.card{background:#fff;border-radius:14px;box-shadow:0 4px 24px rgba(0,0,0,.09);max-width:560px;margin:0 auto;padding:36px}.hdr{margin-bottom:22px;padding-bottom:18px;border-bottom:1px solid #f0f0f0}.hdr h1{font-size:20px;font-weight:800;color:#005DBD}.ok{background:#e8f5e9;border:1px solid #a5d6a7;color:#2e7d32;padding:12px;border-radius:8px;font-size:14px;margin-bottom:16px}.badge{background:#e3f2fd;color:#1565c0;padding:8px 14px;border-radius:8px;font-size:13px;margin-bottom:16px}label{display:block;font-size:13px;font-weight:700;color:#333;margin-top:14px;margin-bottom:4px}input,select,textarea{width:100%;border:1.5px solid #e0e0e0;border-radius:8px;padding:10px 14px;font-size:14px;outline:none}.hr{border:none;border-top:1px solid #f0f0f0;margin:18px 0}.flow{background:#f8f9ff;border:1px solid #e0e8ff;border-radius:10px;padding:14px;margin-top:16px;font-size:13px;color:#444;line-height:1.9}.btn{width:100%;margin-top:22px;background:#D10039;color:#fff;border:none;border-radius:9px;padding:14px;font-size:15px;font-weight:700;cursor:pointer}.foot{margin-top:14px;text-align:center;font-size:11px;color:#ccc}</style></head>'
+    + '<body><div class="card"><div class="hdr"><h1>HandyPay Deposits</h1><span style="font-size:12px;color:#999">Deposit Collection Settings</span></div>'
+    + (msg ? '<div class="ok">' + msg + '</div>' : '')
+    + (isConn ? '<div class="badge">Connected &middot; <code>' + masked + '</code> &middot; ' + curMode.toUpperCase() + '</div>' : '')
+    + '<form method="POST" action="/api/settings"><input type="hidden" name="location_id" value="' + location_id + '">'
+    + '<label>HandyPay API Key *</label><input type="text" name="handypay_api_key" value="' + (isConn ? c.handypay_api_key : '') + '" placeholder="hp_test_... or hp_live_..." required autocomplete="off">'
+    + '<label>Mode</label><select name="mode"><option value="test"' + (curMode !== 'live' ? ' selected' : '') + '>Test Mode</option><option value="live"' + (curMode === 'live' ? ' selected' : '') + '>Live Mode</option></select>'
+    + '<div class="hr"></div>'
+    + '<label>Deposit Amount (whole JMD) *</label><input type="number" name="deposit_amount" value="' + dep + '" min="100" step="100" required>'
+    + '<label>Custom SMS Template (optional)</label><textarea name="sms_template" rows="3" placeholder="Use {name} {amount} {date} {link}. Leave blank for default.">' + (c.sms_template || '') + '</textarea>'
+    + '<div class="flow"><strong>How deposits work:</strong><br>1. Client books in your calendar<br>2. They get an SMS with a HandyPay payment link<br>3. Client pays &rarr; appointment confirmed<br>4. Contact tagged deposit-paid + note added</div>'
+    + '<button type="submit" class="btn">Save &amp; Activate HandyPay</button></form>'
+    + '<div class="foot">HandyPay Deposits v2.0 &middot; L-NET Smart Technologies</div></div></body></html>');
 });
 
 app.post('/api/settings', async (req, res) => {
-  const { location_id, handypay_api_key, deposit_amount, deposit_type, success_url, cancel_url, mode, set_default } = req.body;
+  var location_id = req.body.location_id;
+  var handypay_api_key = req.body.handypay_api_key;
+  var deposit_amount = req.body.deposit_amount;
+  var mode = req.body.mode;
+  var sms_template = req.body.sms_template;
   if (!location_id) return res.status(400).send('Missing location_id');
   try {
-    await pool.query('INSERT INTO merchant_configs (location_id,handypay_api_key,deposit_amount,deposit_type,success_url,cancel_url,mode,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW()) ON CONFLICT (location_id) DO UPDATE SET handypay_api_key=$2,deposit_amount=$3,deposit_type=$4,success_url=$5,cancel_url=$6,mode=$7,updated_at=NOW()', [location_id, handypay_api_key, parseInt(deposit_amount)||5000, deposit_type||'fixed', success_url||'', cancel_url||'', mode||'test']);
-    const { rows } = await pool.query('SELECT crm_access_token FROM merchant_configs WHERE location_id=$1', [location_id]);
+    await pool.query(
+      'INSERT INTO merchant_configs (location_id,handypay_api_key,deposit_amount,mode,sms_template,updated_at) VALUES ($1,$2,$3,$4,$5,NOW()) ON CONFLICT (location_id) DO UPDATE SET handypay_api_key=$2,deposit_amount=$3,mode=$4,sms_template=$5,updated_at=NOW()',
+      [location_id, handypay_api_key, parseInt(deposit_amount) || 5000, mode || 'test', sms_template || '']
+    );
+    var rows = (await pool.query('SELECT crm_access_token FROM merchant_configs WHERE location_id=$1', [location_id])).rows;
     if (rows[0] && rows[0].crm_access_token) {
       await registerPaymentProvider(location_id, rows[0].crm_access_token);
-        await activatePaymentModes(location_id, rows[0].crm_access_token, handypay_api_key, mode || 'test');
-      if (set_default === '1') {
-        try {
-          await fetch(GHL_API + '/payments/custom-provider/provider?locationId=' + location_id, { method: 'POST', headers: { 'Authorization': 'Bearer ' + rows[0].crm_access_token, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ name: 'HandyPay Deposits', description: 'Collect booking deposits automatically.', paymentsUrl: process.env.APP_URL + '/api/pay', queryUrl: process.env.APP_URL + '/api/query', imageUrl: LOGO_URL, supportsSubscriptionSchedule: false, isDefault: true }) });
-          console.log('[set-default] attempted for', location_id);
-        } catch(e) { console.error('[set-default] error:', e.message); }
-      }
-    } else {
-      console.warn('[settings] No CRM token for', location_id, '- re-run OAuth install to store it');
+      await activatePaymentModes(location_id, rows[0].crm_access_token, handypay_api_key, mode || 'test');
+      await activatePaymentModes(location_id, rows[0].crm_access_token, handypay_api_key, mode || 'test');
     }
     res.redirect('/api/settings?location_id=' + location_id + '&saved=true');
-  } catch(err) { res.status(500).send(err.message); }
+  } catch (err) {
+    console.error('[settings POST]', err);
+    res.status(500).send('Error: ' + err.message);
+  }
 });
 
-app.get('/api/pay', async (req, res) => {
-  const { locationId } = req.query;
-  let cfg = {};
-  try { const { rows } = await pool.query('SELECT * FROM merchant_configs WHERE location_id=$1', [locationId]); if (rows.length) cfg = rows[0]; } catch(e){}
-  const dep = cfg.deposit_amount || 5000;
-  res.send('<html><head><title>HandyPay Deposit</title><style>body{font-family:sans-serif;max-width:500px;margin:40px auto;padding:20px;text-align:center}h2{color:#005DBD}.btn{background:#D10039;color:#fff;padding:12px 28px;border:none;border-radius:6px;font-size:16px;cursor:pointer;margin-top:20px;text-decoration:none;display:inline-block}</style></head><body><h2>HandyPay Deposits</h2><p>Deposit Amount: <strong>JMD $' + dep.toLocaleString() + '</strong></p><p style="color:#888;font-size:13px">A payment link will be sent via SMS to the client when an appointment is booked.</p><a class="btn" href="https://handypay.me" target="_blank">Open HandyPay Dashboard</a></body></html>');
+// ============================================================
+// CRM APPOINTMENT WEBHOOK  <-- THE DEPOSIT TRIGGER
+// ============================================================
+app.post('/api/webhooks/crm', async (req, res) => {
+  var raw = Buffer.isBuffer(req.body) ? req.body.toString() : JSON.stringify(req.body);
+  var body = Buffer.isBuffer(req.body) ? JSON.parse(raw) : req.body;
+  var type = body.type;
+  var locationId = body.locationId;
+  var contactId = body.contactId;
+  var appointmentId = body.id;
+  var startTime = body.startTime;
+  var title = body.title;
+
+  console.log('[CRM webhook] type:', type, '| loc:', locationId, '| contact:', contactId);
+
+  var isAppt = ['AppointmentCreate', 'appointmentCreate', 'appointment.create'].indexOf(type) !== -1;
+  if (!isAppt) return res.json({ ok: true, skipped: type });
+
+  try {
+    var config = await getMerchantConfig(locationId);
+    if (!config) return res.json({ ok: true, note: 'no_config' });
+    if (!config.handypay_api_key || config.handypay_api_key === 'hp_pending_setup')
+      return res.json({ ok: true, note: 'api_key_not_set' });
+    if (!config.deposit_amount || config.deposit_amount < 100)
+      return res.json({ ok: true, note: 'deposit_amount_not_set' });
+    if (!contactId) return res.json({ ok: true, note: 'no_contact_id' });
+
+    var accessToken = config.crm_access_token;
+    var contact = body.contact || {};
+
+    // Fetch full contact details
+    if (accessToken && (!contact.phone || !contact.firstName)) {
+      try {
+        var c = await getContact(accessToken, contactId);
+        contact = Object.assign({}, c, contact);
+      } catch (e) {
+        try {
+          accessToken = await refreshCrmToken(locationId);
+          var c2 = await getContact(accessToken, contactId);
+          contact = Object.assign({}, c2, contact);
+        } catch (e2) { console.error('[webhook] contact fetch failed:', e2.message); }
+      }
+    }
+
+    var phone = contact.phone || contact.phoneRaw;
+    if (!phone) {
+      console.error('[webhook] Contact', contactId, 'has no phone number -- skipping SMS');
+      return res.json({ ok: true, note: 'no_phone' });
+    }
+
+    var firstName = contact.firstName || 'there';
+    var depositAmount = config.deposit_amount;
+
+    var apptDate = 'your upcoming appointment';
+    if (startTime) {
+      try {
+        apptDate = new Date(startTime).toLocaleDateString('en-JM', {
+          weekday: 'long', month: 'long', day: 'numeric',
+          hour: '2-digit', minute: '2-digit', timeZone: 'America/Jamaica'
+        });
+      } catch (e) { apptDate = startTime; }
+    }
+
+    console.log('[webhook] Creating HandyPay session -- JMD', depositAmount);
+    var session = await createHandyPaySession(config.handypay_api_key, {
+      amount: depositAmount,
+      currency: 'JMD',
+      contact: { name: firstName, email: contact.email, phone: phone },
+      metadata: {
+        contact_id: contactId, location_id: locationId,
+        appointment_id: appointmentId || '', title: title || ''
+      },
+      successUrl: APP_URL + '/api/payment-success?session_id={CHECKOUT_SESSION_ID}',
+      cancelUrl: APP_URL + '/api/payment-cancel'
+    });
+
+    var paymentUrl = session.url || session.payment_url || session.checkout_url || session.checkoutUrl;
+    var sessionId = session.id || session.session_id || session.sessionId;
+
+    if (!paymentUrl) {
+      console.error('[webhook] No payment URL -- HandyPay response:', JSON.stringify(session));
+      return res.json({ ok: false, error: 'No payment URL from HandyPay', raw: session });
+    }
+
+    // Log to DB
+    await pool.query(
+      'INSERT INTO payment_logs (location_id,session_id,contact_id,appointment_id,amount,currency,status,access_token,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()) ON CONFLICT (session_id) DO NOTHING',
+      [locationId, sessionId, contactId, appointmentId || '', depositAmount, 'JMD', 'pending', accessToken]
+    );
+
+    // Build SMS message
+    var tmpl = config.sms_template;
+    var sms;
+    if (tmpl) {
+      sms = tmpl
+        .replace('{name}', firstName)
+        .replace('{amount}', depositAmount.toLocaleString())
+        .replace('{date}', apptDate)
+        .replace('{link}', paymentUrl);
+    } else {
+      sms = 'Hi ' + firstName + '! Your appointment for ' + apptDate + ' has been requested.
+
+Pay your deposit of JMD $' + depositAmount.toLocaleString() + ' to confirm your spot:
+
+' + paymentUrl + '
+
+Link expires in 24 hours.';
+    }
+
+    await sendSms(accessToken, locationId, contactId, sms);
+    console.log('[webhook] Deposit SMS sent | session:', sessionId, '| contact:', contactId);
+
+    res.json({ ok: true, sessionId: sessionId, smsStatus: 'sent' });
+  } catch (err) {
+    console.error('[CRM webhook ERROR]', err.message, err.stack);
+    res.json({ ok: false, error: err.message });
+  }
+});
+
+// ============================================================
+// HANDYPAY PAYMENT WEBHOOK  <-- CONFIRM DEPOSIT
+// ============================================================
+app.post('/api/webhooks/handypay', async (req, res) => {
+  var raw = Buffer.isBuffer(req.body) ? req.body.toString() : JSON.stringify(req.body);
+  var sig = req.headers['handypay-signature'] || req.headers['stripe-signature'] || req.headers['x-handypay-signature'] || '';
+
+  if (process.env.HANDYPAY_WEBHOOK_SECRET && sig) {
+    var expected = crypto.createHmac('sha256', process.env.HANDYPAY_WEBHOOK_SECRET).update(raw).digest('hex');
+    if (sig.indexOf(expected) === -1) {
+      console.error('[hp webhook] Bad signature');
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+  }
+
+  var body = Buffer.isBuffer(req.body) ? JSON.parse(raw) : req.body;
+  var type = body.type;
+  var data = body.data;
+  console.log('[HP webhook] type:', type);
+
+  var isPaid = ['payment.succeeded', 'checkout.session.completed', 'payment_intent.succeeded'].indexOf(type) !== -1;
+  if (!isPaid) return res.json({ ok: true, skipped: type });
+
+  var obj = (data && data.object) || data || {};
+  var sessionId = obj.id || obj.session_id || body.id;
+  var amountReceived = obj.amount_total || obj.amount || obj.amount_received;
+
+  res.json({ ok: true });
+
+  try {
+    var log = await getPaymentLogBySession(sessionId);
+    if (!log) { console.error('[hp webhook] No log for session:', sessionId); return; }
+
+    var contactId = log.contact_id;
+    var accessToken = log.access_token;
+    var amount = log.amount;
+    var locationId = log.location_id;
+    var appointmentId = log.appointment_id;
+
+    await addContactTag(accessToken, contactId, ['deposit-paid']);
+    await addContactNote(accessToken, contactId,
+      'Deposit Received
+Amount: JMD $' + ((amount || amountReceived || 0)).toLocaleString() + '
+Session: ' + sessionId + '
+Appointment: ' + (appointmentId || 'N/A') + '
+Powered by HandyPay'
+    );
+    await updatePaymentLogStatus(sessionId, 'paid');
+    console.log('[hp webhook] Deposit confirmed | contact:', contactId, '| JMD', amount);
+  } catch (err) {
+    console.error('[hp webhook ERROR]', err.message);
+  }
+});
+
+// ============================================================
+// PAYMENT SUCCESS / CANCEL PAGES
+// ============================================================
+app.get('/api/payment-success', (req, res) => {
+  res.setHeader('Content-Type', 'text/html');
+  res.send('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Payment Confirmed</title><style>body{font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#f0fdf4;margin:0}.c{background:#fff;border-radius:16px;padding:40px;text-align:center;max-width:400px;box-shadow:0 4px 20px rgba(0,0,0,.08)}.i{font-size:56px;margin-bottom:16px}h1{color:#065f46;font-size:22px;margin-bottom:8px}p{color:#374151;font-size:15px;line-height:1.5}</style></head><body><div class="c"><div class="i">&#x2705;</div><h1>Deposit Paid!</h1><p>Your appointment is confirmed. You will receive a confirmation message shortly.</p><p style="margin-top:16px;font-size:12px;color:#9ca3af">Powered by HandyPay</p></div></body></html>');
+});
+
+app.get('/api/payment-cancel', (req, res) => {
+  res.setHeader('Content-Type', 'text/html');
+  res.send('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Payment Cancelled</title><style>body{font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#fef2f2;margin:0}.c{background:#fff;border-radius:16px;padding:40px;text-align:center;max-width:400px;box-shadow:0 4px 20px rgba(0,0,0,.08)}.i{font-size:56px;margin-bottom:16px}h1{color:#991b1b;font-size:22px;margin-bottom:8px}p{color:#374151;font-size:15px;line-height:1.5}</style></head><body><div class="c"><div class="i">&#x274C;</div><h1>Payment Not Completed</h1><p>Your appointment has not been confirmed yet. Please contact us to complete your booking.</p></div></body></html>');
+});
+
+// ============================================================
+// PAY + QUERY (for CRM payment provider engine)
+// ============================================================
+app.post('/api/pay', async (req, res) => {
+  var body = Buffer.isBuffer(req.body) ? JSON.parse(req.body.toString()) : req.body;
+  var amount = body.amount, currency = body.currency, contactId = body.contactId, locationId = body.locationId;
+  try {
+    var config = await getMerchantConfig(locationId);
+    if (!config || !config.handypay_api_key) return res.status(400).json({ error: 'HandyPay not configured' });
+    var session = await createHandyPaySession(config.handypay_api_key, {
+      amount: Math.round(amount), currency: currency || 'JMD', contact: {},
+      metadata: { contact_id: contactId, location_id: locationId },
+      successUrl: APP_URL + '/api/payment-success?session_id={CHECKOUT_SESSION_ID}',
+      cancelUrl: APP_URL + '/api/payment-cancel'
+    });
+    res.json({ paymentUrl: session.url || session.payment_url, sessionId: session.id });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/query', async (req, res) => {
-  const body = Buffer.isBuffer(req.body) ? JSON.parse(req.body.toString()) : req.body;
-  console.log('CRM payment query:', JSON.stringify(body));
-  res.json({ status: 'ok', received: true });
-});
-
-app.get('/api/settings', async (req, res) => { });
-
-app.post('/api/webhooks/handypay', async (req, res) => {
-  const raw = Buffer.isBuffer(req.body) ? req.body.toString() : JSON.stringify(req.body);
-  const sig = req.headers['handypay-signature'] || req.headers['stripe-signature'] || '';
-  if (process.env.HANDYPAY_WEBHOOK_SECRET && sig) {
-    const exp = crypto.createHmac('sha256', process.env.HANDYPAY_WEBHOOK_SECRET).update(raw).digest('hex');
-    const sv = sig.includes('=') ? sig.split('=').pop() : sig;
-    if (sv !== exp) return res.status(401).json({ error: 'Bad signature' });
-  }
-  const event = Buffer.isBuffer(req.body) ? JSON.parse(raw) : req.body;
-  console.log('HP event:', event.type);
+  var body = Buffer.isBuffer(req.body) ? JSON.parse(req.body.toString()) : req.body;
+  var sessionId = body.sessionId;
   try {
-    const s = event.data && event.data.object || event.data || {}, m = s.metadata || {};
-    if (m.location_id && m.contact_id && (event.type === 'checkout.session.completed' || event.type === 'payment_intent.succeeded')) {
-      const { rows } = await pool.query('SELECT crm_access_token FROM merchant_configs WHERE location_id=$1', [m.location_id]);
-      if (rows.length && rows[0].crm_access_token) {
-        const tok = rows[0].crm_access_token, amt = ((s.amount_total || s.amount || 0) / 100).toLocaleString();
-        await fetch(GHL_API + '/contacts/' + m.contact_id + '/notes', { method: 'POST', headers: { 'Authorization': 'Bearer ' + tok, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ body: 'Deposit received: JMD $' + amt + ' | ID: ' + s.id + ' | ' + new Date().toLocaleString() }) });
-        await fetch(GHL_API + '/contacts/' + m.contact_id + '/tags', { method: 'POST', headers: { 'Authorization': 'Bearer ' + tok, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ tags: ['deposit-paid'] }) });
-        await pool.query('INSERT INTO payment_logs (location_id,contact_id,payment_id,amount_jmd,event_type) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING', [m.location_id, m.contact_id, s.id, s.amount_total || s.amount || 0, event.type]);
-      }
-    }
-    if (event.type === 'charge.refunded' && m.location_id && m.contact_id) {
-      const { rows } = await pool.query('SELECT crm_access_token FROM merchant_configs WHERE location_id=$1', [m.location_id]);
-      if (rows.length) await fetch(GHL_API + '/contacts/' + m.contact_id + '/tags', { method: 'POST', headers: { 'Authorization': 'Bearer ' + rows[0].crm_access_token, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ tags: ['deposit-refunded'] }) });
-    }
-  } catch(err){ console.error('HP webhook err:', err); }
-  res.json({ received: true });
+    var log = await getPaymentLogBySession(sessionId);
+    res.json({ status: (log && log.status) || 'pending', sessionId: sessionId });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/webhooks/crm', async (req, res) => {
-  const e = Buffer.isBuffer(req.body) ? JSON.parse(req.body.toString()) : req.body;
-  if (e.type !== 'AppointmentCreate') return res.json({ skipped: e.type });
-  try {
-    const locId = e.locationId, conId = e.contactId || e.contact && e.contact.id;
-    const fn = e.contact && e.contact.firstName || 'there', title = e.appointment && e.appointment.title || 'Your Appointment';
-    const { rows } = await pool.query('SELECT * FROM merchant_configs WHERE location_id=$1', [locId]);
-    if (!rows.length || !rows[0].handypay_api_key || rows[0].handypay_api_key === 'hp_pending_setup') return res.json({ skipped: 'no-config' });
-    const cfg = rows[0], dep = cfg.deposit_amount || 5000;
-    const sr = await fetch(HP_BASE + '/payment-sessions', { method: 'POST', headers: { 'Authorization': 'Bearer ' + cfg.handypay_api_key, 'Content-Type': 'application/json' }, body: JSON.stringify({ line_items: [{ name: 'Deposit - ' + title, amount: dep * 100, currency: 'jmd', quantity: 1 }], customer_email: e.contact && e.contact.email || undefined, success_url: cfg.success_url || process.env.APP_URL + '/success', cancel_url: cfg.cancel_url || process.env.APP_URL + '/cancel', metadata: { location_id: locId, contact_id: conId, appointment_title: title } }) });
-    const sess = await sr.json();
-    if ((sess.data && sess.data.url || sess.url) && cfg.crm_access_token) {
-      const link = sess.data && sess.data.url || sess.url;
-      const smsMsg = 'Hi ' + fn + '! Pay your deposit (JMD $' + dep.toLocaleString() + ') to confirm ' + title + ': ' + link + ' - Link expires in 24 hours.';
-      await fetch(GHL_API + '/conversations/messages', { method: 'POST', headers: { 'Authorization': 'Bearer ' + cfg.crm_access_token, 'Content-Type': 'application/json', 'Version': '2021-04-15' }, body: JSON.stringify({ type: 'SMS', contactId: conId, message: smsMsg }) });
-      await fetch(GHL_API + '/contacts/' + conId + '/notes', { method: 'POST', headers: { 'Authorization': 'Bearer ' + cfg.crm_access_token, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ body: 'Deposit link sent: JMD $' + dep.toLocaleString() + ' | Session: ' + (sess.data && sess.data.id || sess.id) }) });
-    }
-  } catch(err){ console.error('CRM webhook err:', err); }
-  res.json({ received: true });
-});
-
-app.post('/api/session', async (req, res) => {
-  const { location_id, contact_id, amount, description, type = 'one_time', price_id } = req.body;
-  if (!location_id || !contact_id) return res.status(400).json({ error: 'location_id and contact_id required' });
-  try {
-    const { rows } = await pool.query('SELECT * FROM merchant_configs WHERE location_id=$1', [location_id]);
-    if (!rows.length || !rows[0].handypay_api_key) return res.status(404).json({ error: 'Not configured' });
-    const cfg = rows[0], dep = amount || cfg.deposit_amount || 5000;
-    let ep, body;
-    if (type === 'subscription' && price_id) {
-      ep = HP_BASE + '/subscription-sessions';
-      body = { price_id, success_url: cfg.success_url || process.env.APP_URL + '/success', cancel_url: cfg.cancel_url || process.env.APP_URL + '/cancel', metadata: { location_id, contact_id } };
-    } else {
-      ep = HP_BASE + '/payment-sessions';
-      body = { line_items: [{ name: description || 'Deposit Payment', amount: dep * 100, currency: 'jmd', quantity: 1 }], success_url: cfg.success_url || process.env.APP_URL + '/success', cancel_url: cfg.cancel_url || process.env.APP_URL + '/cancel', metadata: { location_id, contact_id } };
-    }
-    const sr = await fetch(ep, { method: 'POST', headers: { 'Authorization': 'Bearer ' + cfg.handypay_api_key, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    const sess = await sr.json();
-    res.json({ url: sess.data && sess.data.url || sess.url, session_id: sess.data && sess.data.id || sess.id, amount_jmd: dep });
-  } catch(err){ res.status(500).json({ error: err.message }); }
-});
-
+// ============================================================
+// DB INIT + MIGRATION
+// ============================================================
 app.get('/api/init-db', async (req, res) => {
-  if ((req.headers['x-init-secret'] || req.query.secret) !== process.env.INIT_SECRET) return res.status(403).json({ error: 'Forbidden' });
+  if (req.query.secret !== process.env.INIT_SECRET) return res.status(403).json({ error: 'Forbidden' });
   try {
-    await pool.query("CREATE TABLE IF NOT EXISTS merchant_configs (id SERIAL PRIMARY KEY,location_id VARCHAR(100) UNIQUE NOT NULL,handypay_api_key TEXT,crm_access_token TEXT,crm_refresh_token TEXT,deposit_amount INTEGER DEFAULT 5000,deposit_type VARCHAR(20) DEFAULT 'fixed',mode VARCHAR(10) DEFAULT 'test',success_url TEXT,cancel_url TEXT,created_at TIMESTAMPTZ DEFAULT NOW(),updated_at TIMESTAMPTZ DEFAULT NOW()); ALTER TABLE merchant_configs ADD COLUMN IF NOT EXISTS mode VARCHAR(10) DEFAULT 'test'; CREATE TABLE IF NOT EXISTS payment_logs (id SERIAL PRIMARY KEY,location_id VARCHAR(100),contact_id VARCHAR(100),payment_id TEXT UNIQUE,amount_jmd INTEGER,event_type VARCHAR(50),created_at TIMESTAMPTZ DEFAULT NOW()); CREATE INDEX IF NOT EXISTS idx_mc_loc ON merchant_configs(location_id); CREATE INDEX IF NOT EXISTS idx_pl_loc ON payment_logs(location_id);");
-    res.json({ ok: true, message: 'DB initialized.' });
-  } catch(err){ res.status(500).json({ error: err.message }); }
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS merchant_configs (
+        location_id VARCHAR(255) PRIMARY KEY,
+        handypay_api_key TEXT,
+        crm_access_token TEXT,
+        crm_refresh_token TEXT,
+        mode VARCHAR(20) DEFAULT 'test',
+        deposit_amount INTEGER DEFAULT 5000,
+        sms_template TEXT DEFAULT '',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS payment_logs (
+        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+        location_id VARCHAR(255),
+        session_id VARCHAR(255),
+        contact_id VARCHAR(255),
+        appointment_id VARCHAR(255),
+        amount INTEGER,
+        currency VARCHAR(10) DEFAULT 'JMD',
+        status VARCHAR(50) DEFAULT 'pending',
+        access_token TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      ALTER TABLE merchant_configs ADD COLUMN IF NOT EXISTS sms_template TEXT DEFAULT '';
+      ALTER TABLE merchant_configs ADD COLUMN IF NOT EXISTS deposit_amount INTEGER DEFAULT 5000;
+      ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS appointment_id VARCHAR(255);
+      ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS access_token TEXT;
+      ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+      CREATE UNIQUE INDEX IF NOT EXISTS payment_logs_session_id_idx ON payment_logs(session_id);
+    `);
+    res.json({ ok: true, message: 'DB initialized/migrated.' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/success', (req, res) => res.send('<html><body style="text-align:center;font-family:sans-serif;padding:60px"><h1 style="color:#28a745">Deposit Received!</h1><p>Booking confirmed.</p></body></html>'));
-app.get('/cancel', (req, res) => res.send('<html><body style="text-align:center;font-family:sans-serif;padding:60px"><h1 style="color:#dc3545">Cancelled</h1><p>No charge made.</p></body></html>'));
-
-app.listen(process.env.PORT || 3000, () => console.log('HandyPay Deposits running'));
 module.exports = app;
