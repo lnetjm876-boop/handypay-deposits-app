@@ -81,7 +81,7 @@ async function sendSms(accessToken, locationId, contactId, message) {
     conversationId = sd.conversations && sd.conversations[0] && sd.conversations[0].id;
   }
   if (!conversationId) {
-    const cr = await fetch(GHL_API + '/conversations/', {
+    const cr = await fetch(GHL_API + '/conversations', {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-04-15' },
       body: JSON.stringify({ contactId: contactId, locationId: locationId })
@@ -93,7 +93,7 @@ async function sendSms(accessToken, locationId, contactId, message) {
   const mr = await fetch(GHL_API + '/conversations/messages', {
     method: 'POST',
     headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-04-15' },
-    body: JSON.stringify({ type: 'SMS', message: message, conversationId: conversationId })
+    body: JSON.stringify({ type: 'SMS', message: message, conversationId: conversationId, contactId: contactId })
   });
   if (!mr.ok) {
     const errText = await mr.text();
