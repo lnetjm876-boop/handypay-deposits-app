@@ -134,7 +134,7 @@ async function createHandyPaySession(apiKey, opts) {
     line_items: [{
       amount: amount,
       currency: currency.toLowerCase(),
-      name: 'Appointment Deposit'
+      name: 'Appointment Deposit',
       quantity: 1
     }],
     mode: 'payment',
