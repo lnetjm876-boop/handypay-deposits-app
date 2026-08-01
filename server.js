@@ -294,7 +294,7 @@ app.post('/api/webhooks/crm', async (req, res) => {
 
   console.log('[CRM webhook] type:', type, '| loc:', locationId, '| contact:', contactId);
 
-  var isAppt = ['AppointmentCreate', 'appointmentCreate', 'appointment.create'].indexOf(type) !== -1;
+  var isAppt = !type || ['AppointmentCreate', 'appointmentCreate', 'appointment.create'].indexOf(type) !== -1;
   if (!isAppt) return res.json({ ok: true, skipped: type });
 
   try {
