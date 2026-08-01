@@ -15,14 +15,20 @@ app.get('/api/oauth/callback', async (req, res) => {
   try {
     const t = await fetch('https://services.leadconnectorhq.com/oauth/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ client_id: process.env.GHL_CLIENT_ID, client_secret: process.env.GHL_CLIENT_SECRET, grant_type: 'authorization_code', code, redirect_uri: process.env.APP_URL + '/api/oauth/callback' }) });
     const tokens = await t.json();
+    console.log('OAuth response:', JSON.stringify({ keys: Object.keys(tokens), userType: tokens.userType, locationId: tokens.locationId, companyId: tokens.companyId, hasToken: !!tokens.access_token }));
     if (!tokens.access_token) return res.status(400).send('Token error: ' + JSON.stringify(tokens));
-    await pool.query('INSERT INTO merchant_configs (location_id,crm_access_token,crm_refresh_token) VALUES ($1,$2,$3) ON CONFLICT (location_id) DO UPDATE SET crm_access_token=$2,crm_refresh_token=$3,updated_at=NOW()', [tokens.locationId, tokens.access_token, tokens.refresh_token]);
+    const locationId = tokens.locationId || null;
+    if (!locationId) {
+      console.error('Company-level token received — no locationId. userType:', tokens.userType);
+      return res.send('<html><head><title>HandyPay Deposits</title><style>body{font-family:sans-serif;max-width:600px;margin:60px auto;padding:20px;text-align:center}h2{color:#D10039}p{color:#444}.note{color:#888;font-size:12px;margin-top:20px}</style></head><body><h2>Sub-Account Install Required</h2><p>HandyPay Deposits must be installed <strong>per sub-account</strong>, not at the agency level.</p><p>Please use the sub-account install link provided by L-NET, or contact support.</p><p class="note">Debug: userType=' + tokens.userType + ' | companyId=' + tokens.companyId + '</p></body></html>');
+    }
+    await pool.query('INSERT INTO merchant_configs (location_id,crm_access_token,crm_refresh_token) VALUES ($1,$2,$3) ON CONFLICT (location_id) DO UPDATE SET crm_access_token=$2,crm_refresh_token=$3,updated_at=NOW()', [locationId, tokens.access_token, tokens.refresh_token]);
     try {
-      const provRes = await fetch('https://services.leadconnectorhq.com/payments/custom-provider/provider?locationId=' + tokens.locationId, { method: 'POST', headers: { 'Authorization': 'Bearer ' + tokens.access_token, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ name: 'HandyPay Deposits', description: 'Collect booking deposits automatically. Clients get an SMS payment link when they book.', paymentsUrl: process.env.APP_URL + '/api/pay', queryUrl: process.env.APP_URL + '/api/query', imageUrl: LOGO_URL, supportsSubscriptionSchedule: false }) });
+      const provRes = await fetch('https://services.leadconnectorhq.com/payments/custom-provider/provider?locationId=' + locationId, { method: 'POST', headers: { 'Authorization': 'Bearer ' + tokens.access_token, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ name: 'HandyPay Deposits', description: 'Collect booking deposits automatically. Clients get an SMS payment link when they book.', paymentsUrl: process.env.APP_URL + '/api/pay', queryUrl: process.env.APP_URL + '/api/query', imageUrl: LOGO_URL, supportsSubscriptionSchedule: false }) });
       const provData = await provRes.json();
       console.log('Payment provider registered:', JSON.stringify(provData));
     } catch (provErr) { console.error('Provider registration failed (non-fatal):', provErr.message); }
-    res.redirect('/api/settings?location_id=' + tokens.locationId + '&installed=true');
+    res.redirect('/api/settings?location_id=' + locationId + '&installed=true');
   } catch (err) { res.status(500).send('OAuth error: ' + err.message); }
 });
 app.get('/api/logo', (req, res) => { res.redirect(LOGO_URL); });
