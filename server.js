@@ -153,7 +153,8 @@ async function createHandyPaySession(apiKey, opts) {
   var text = await r.text();
   console.log('[HandyPay] Session response:', r.status, text.substring(0, 300));
   if (!r.ok) throw new Error('HandyPay session ' + r.status + ': ' + text);
-  return JSON.parse(text);
+  var parsed = JSON.parse(text);
+  return parsed.data || parsed; // HandyPay wraps in {success,data}
 }
 
 // ============================================================
