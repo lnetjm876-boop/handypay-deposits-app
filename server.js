@@ -24,7 +24,7 @@ async function registerPaymentProvider(locationId, accessToken) {
       body: JSON.stringify({ name: 'HandyPay Deposits', description: 'Collect booking deposits automatically. Clients get an SMS payment link when they book.', paymentsUrl: process.env.APP_URL + '/api/pay', queryUrl: process.env.APP_URL + '/api/query', imageUrl: LOGO_URL, supportsSubscriptionSchedule: false })
     });
     const d = await r.json();
-    console.log('[register]', locationId, r.status, d._id || d.message || '');
+    console.log('[register]', locationId, r.status, JSON.stringify(d).substring(0,300));
     return d;
   } catch (e) { console.error('[register] error:', e.message); }
 }
@@ -39,7 +39,7 @@ async function activatePaymentModes(locationId, accessToken, apiKey, mode) {
       body: JSON.stringify({ locationId, live: { apiKey: key, publishableKey: key, liveMode: isLive }, test: { apiKey: key, publishableKey: key, liveMode: !isLive } })
     });
     const d = await r.json();
-    console.log('[activate]', locationId, mode, r.status);
+    console.log('[activate]', locationId, mode, r.status, JSON.stringify(d).substring(0,300));
     return d;
   } catch (e) { console.error('[activate] error:', e.message); }
 }
@@ -89,7 +89,8 @@ app.post('/api/settings', async (req, res) => {
     await pool.query('INSERT INTO merchant_configs (location_id,handypay_api_key,deposit_amount,deposit_type,success_url,cancel_url,mode,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW()) ON CONFLICT (location_id) DO UPDATE SET handypay_api_key=$2,deposit_amount=$3,deposit_type=$4,success_url=$5,cancel_url=$6,mode=$7,updated_at=NOW()', [location_id, handypay_api_key, parseInt(deposit_amount)||5000, deposit_type||'fixed', success_url||'', cancel_url||'', mode||'test']);
     const { rows } = await pool.query('SELECT crm_access_token FROM merchant_configs WHERE location_id=$1', [location_id]);
     if (rows[0] && rows[0].crm_access_token) {
-      await activatePaymentModes(location_id, rows[0].crm_access_token, handypay_api_key, mode || 'test');
+      await registerPaymentProvider(location_id, rows[0].crm_access_token);
+        await activatePaymentModes(location_id, rows[0].crm_access_token, handypay_api_key, mode || 'test');
       if (set_default === '1') {
         try {
           await fetch(GHL_API + '/payments/custom-provider/provider?locationId=' + location_id, { method: 'POST', headers: { 'Authorization': 'Bearer ' + rows[0].crm_access_token, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ name: 'HandyPay Deposits', description: 'Collect booking deposits automatically.', paymentsUrl: process.env.APP_URL + '/api/pay', queryUrl: process.env.APP_URL + '/api/query', imageUrl: LOGO_URL, supportsSubscriptionSchedule: false, isDefault: true }) });
