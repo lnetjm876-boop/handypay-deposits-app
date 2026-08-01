@@ -126,23 +126,34 @@ async function addContactNote(accessToken, contactId, body) {
 // HANDYPAY HELPERS
 // ============================================================
 async function createHandyPaySession(apiKey, opts) {
-  var amount = opts.amount, currency = opts.currency, contact = opts.contact || {},
-      metadata = opts.metadata || {}, successUrl = opts.successUrl, cancelUrl = opts.cancelUrl;
+  var amount = opts.amount, currency = opts.currency || 'JMD',
+      contact = opts.contact || {}, metadata = opts.metadata || {},
+      successUrl = opts.successUrl, cancelUrl = opts.cancelUrl;
+  // HandyPay (Stripe Connect) requires line_items format
   var payload = {
-    amount: amount,
-    currency: currency || 'JMD',
+    line_items: [{
+      price_data: {
+        currency: currency.toLowerCase(),
+        unit_amount: amount,
+        product_data: { name: 'Appointment Deposit' }
+      },
+      quantity: 1
+    }],
+    mode: 'payment',
     success_url: successUrl,
     cancel_url: cancelUrl,
     metadata: metadata
   };
   if (contact.email) payload.customer_email = contact.email;
   if (contact.name) payload.customer_name = contact.name;
+  console.log('[HandyPay] Creating session, amount:', amount, currency);
   var r = await fetch(HP_BASE + '/payment-sessions', {
     method: 'POST',
     headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   });
   var text = await r.text();
+  console.log('[HandyPay] Session response:', r.status, text.substring(0, 300));
   if (!r.ok) throw new Error('HandyPay session ' + r.status + ': ' + text);
   return JSON.parse(text);
 }
