@@ -132,7 +132,7 @@ async function createHandyPaySession(apiKey, opts) {
   // HandyPay (Stripe Connect) requires line_items format
   var payload = {
     line_items: [{
-      amount: amount,
+      amount: amount * 100, // JMD uses cents (smallest unit)
       currency: currency.toLowerCase(),
       name: 'Appointment Deposit',
       quantity: 1
