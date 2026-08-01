@@ -2,7 +2,7 @@ const express = require('express');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 const app = express();
-const L-NET Smart Technologies and Services_API = 'https://services.leadconnectorhq.com';
+const GHL_API = 'https://services.leadconnectorhq.com';
 const HP_BASE = 'https://api.handypay.me/api/v1';
 
 app.use('/api/webhooks', express.raw({ type: 'application/json' }));
@@ -18,7 +18,7 @@ app.get('/api/logo', (req, res) => res.redirect(LOGO_URL));
 
 async function registerPaymentProvider(locationId, accessToken) {
   try {
-    const r = await fetch(L-NET Smart Technologies and Services_API + '/payments/custom-provider/provider?locationId=' + locationId, {
+    const r = await fetch(GHL_API + '/payments/custom-provider/provider?locationId=' + locationId, {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
       body: JSON.stringify({ name: 'HandyPay Deposits', description: 'Collect booking deposits automatically. Clients get an SMS payment link when they book.', paymentsUrl: process.env.APP_URL + '/api/pay', queryUrl: process.env.APP_URL + '/api/query', imageUrl: LOGO_URL, supportsSubscriptionSchedule: false })
@@ -33,7 +33,7 @@ async function activatePaymentModes(locationId, accessToken, apiKey, mode) {
   const isLive = mode === 'live';
   const key = apiKey || 'hp_pending_setup';
   try {
-    const r = await fetch(L-NET Smart Technologies and Services_API + '/payments/custom-provider/connect?locationId=' + locationId, {
+    const r = await fetch(GHL_API + '/payments/custom-provider/connect?locationId=' + locationId, {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
       body: JSON.stringify({ locationId, live: { apiKey: key, publishableKey: key, liveMode: isLive }, test: { apiKey: key, publishableKey: key, liveMode: !isLive } })
@@ -48,10 +48,10 @@ app.get('/api/oauth/callback', async (req, res) => {
   const { code } = req.query;
   if (!code) return res.status(400).send('Missing code');
   try {
-    const t = await fetch(L-NET Smart Technologies and Services_API + '/oauth/token', {
+    const t = await fetch(GHL_API + '/oauth/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ client_id: process.env.L-NET Smart Technologies and Services_CLIENT_ID, client_secret: process.env.L-NET Smart Technologies and Services_CLIENT_SECRET, grant_type: 'authorization_code', code, redirect_uri: process.env.APP_URL + '/api/oauth/callback' })
+      body: new URLSearchParams({ client_id: process.env.GHL_CLIENT_ID, client_secret: process.env.GHL_CLIENT_SECRET, grant_type: 'authorization_code', code, redirect_uri: process.env.APP_URL + '/api/oauth/callback' })
     });
     const tokens = await t.json();
     console.log('OAuth response:', JSON.stringify({ keys: Object.keys(tokens), userType: tokens.userType, locationId: tokens.locationId, companyId: tokens.companyId, hasToken: !!tokens.access_token }));
@@ -92,7 +92,7 @@ app.post('/api/settings', async (req, res) => {
       await activatePaymentModes(location_id, rows[0].crm_access_token, handypay_api_key, mode || 'test');
       if (set_default === '1') {
         try {
-          await fetch(L-NET Smart Technologies and Services_API + '/payments/custom-provider/provider?locationId=' + location_id, { method: 'POST', headers: { 'Authorization': 'Bearer ' + rows[0].crm_access_token, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ name: 'HandyPay Deposits', description: 'Collect booking deposits automatically.', paymentsUrl: process.env.APP_URL + '/api/pay', queryUrl: process.env.APP_URL + '/api/query', imageUrl: LOGO_URL, supportsSubscriptionSchedule: false, isDefault: true }) });
+          await fetch(GHL_API + '/payments/custom-provider/provider?locationId=' + location_id, { method: 'POST', headers: { 'Authorization': 'Bearer ' + rows[0].crm_access_token, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ name: 'HandyPay Deposits', description: 'Collect booking deposits automatically.', paymentsUrl: process.env.APP_URL + '/api/pay', queryUrl: process.env.APP_URL + '/api/query', imageUrl: LOGO_URL, supportsSubscriptionSchedule: false, isDefault: true }) });
           console.log('[set-default] attempted for', location_id);
         } catch(e) { console.error('[set-default] error:', e.message); }
       }
@@ -135,14 +135,14 @@ app.post('/api/webhooks/handypay', async (req, res) => {
       const { rows } = await pool.query('SELECT crm_access_token FROM merchant_configs WHERE location_id=$1', [m.location_id]);
       if (rows.length && rows[0].crm_access_token) {
         const tok = rows[0].crm_access_token, amt = ((s.amount_total || s.amount || 0) / 100).toLocaleString();
-        await fetch(L-NET Smart Technologies and Services_API + '/contacts/' + m.contact_id + '/notes', { method: 'POST', headers: { 'Authorization': 'Bearer ' + tok, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ body: 'Deposit received: JMD $' + amt + ' | ID: ' + s.id + ' | ' + new Date().toLocaleString() }) });
-        await fetch(L-NET Smart Technologies and Services_API + '/contacts/' + m.contact_id + '/tags', { method: 'POST', headers: { 'Authorization': 'Bearer ' + tok, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ tags: ['deposit-paid'] }) });
+        await fetch(GHL_API + '/contacts/' + m.contact_id + '/notes', { method: 'POST', headers: { 'Authorization': 'Bearer ' + tok, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ body: 'Deposit received: JMD $' + amt + ' | ID: ' + s.id + ' | ' + new Date().toLocaleString() }) });
+        await fetch(GHL_API + '/contacts/' + m.contact_id + '/tags', { method: 'POST', headers: { 'Authorization': 'Bearer ' + tok, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ tags: ['deposit-paid'] }) });
         await pool.query('INSERT INTO payment_logs (location_id,contact_id,payment_id,amount_jmd,event_type) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING', [m.location_id, m.contact_id, s.id, s.amount_total || s.amount || 0, event.type]);
       }
     }
     if (event.type === 'charge.refunded' && m.location_id && m.contact_id) {
       const { rows } = await pool.query('SELECT crm_access_token FROM merchant_configs WHERE location_id=$1', [m.location_id]);
-      if (rows.length) await fetch(L-NET Smart Technologies and Services_API + '/contacts/' + m.contact_id + '/tags', { method: 'POST', headers: { 'Authorization': 'Bearer ' + rows[0].crm_access_token, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ tags: ['deposit-refunded'] }) });
+      if (rows.length) await fetch(GHL_API + '/contacts/' + m.contact_id + '/tags', { method: 'POST', headers: { 'Authorization': 'Bearer ' + rows[0].crm_access_token, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ tags: ['deposit-refunded'] }) });
     }
   } catch(err){ console.error('HP webhook err:', err); }
   res.json({ received: true });
@@ -162,8 +162,8 @@ app.post('/api/webhooks/crm', async (req, res) => {
     if ((sess.data && sess.data.url || sess.url) && cfg.crm_access_token) {
       const link = sess.data && sess.data.url || sess.url;
       const smsMsg = 'Hi ' + fn + '! Pay your deposit (JMD $' + dep.toLocaleString() + ') to confirm ' + title + ': ' + link + ' - Link expires in 24 hours.';
-      await fetch(L-NET Smart Technologies and Services_API + '/conversations/messages', { method: 'POST', headers: { 'Authorization': 'Bearer ' + cfg.crm_access_token, 'Content-Type': 'application/json', 'Version': '2021-04-15' }, body: JSON.stringify({ type: 'SMS', contactId: conId, message: smsMsg }) });
-      await fetch(L-NET Smart Technologies and Services_API + '/contacts/' + conId + '/notes', { method: 'POST', headers: { 'Authorization': 'Bearer ' + cfg.crm_access_token, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ body: 'Deposit link sent: JMD $' + dep.toLocaleString() + ' | Session: ' + (sess.data && sess.data.id || sess.id) }) });
+      await fetch(GHL_API + '/conversations/messages', { method: 'POST', headers: { 'Authorization': 'Bearer ' + cfg.crm_access_token, 'Content-Type': 'application/json', 'Version': '2021-04-15' }, body: JSON.stringify({ type: 'SMS', contactId: conId, message: smsMsg }) });
+      await fetch(GHL_API + '/contacts/' + conId + '/notes', { method: 'POST', headers: { 'Authorization': 'Bearer ' + cfg.crm_access_token, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ body: 'Deposit link sent: JMD $' + dep.toLocaleString() + ' | Session: ' + (sess.data && sess.data.id || sess.id) }) });
     }
   } catch(err){ console.error('CRM webhook err:', err); }
   res.json({ received: true });
