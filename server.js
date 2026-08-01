@@ -6,6 +6,7 @@ app.use('/api/webhooks', express.raw({ type: 'application/json' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+const LOGO_URL = 'https://storage.googleapis.com/crm-conversations-ai-production/ask-ai-images/1785549533996/aaf88bbe-7f89-44b6-ba1b-12a6417755f6.png';
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'HandyPay Deposits v1.0' }));
 app.get('/api/health', (req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }));
 app.get('/api/oauth/callback', async (req, res) => {
@@ -17,14 +18,14 @@ app.get('/api/oauth/callback', async (req, res) => {
     if (!tokens.access_token) return res.status(400).send('Token error: ' + JSON.stringify(tokens));
     await pool.query('INSERT INTO merchant_configs (location_id,crm_access_token,crm_refresh_token) VALUES ($1,$2,$3) ON CONFLICT (location_id) DO UPDATE SET crm_access_token=$2,crm_refresh_token=$3,updated_at=NOW()', [tokens.locationId, tokens.access_token, tokens.refresh_token]);
     try {
-      const provRes = await fetch('https://services.leadconnectorhq.com/payments/custom-provider/provider?locationId=' + tokens.locationId, { method: 'POST', headers: { 'Authorization': 'Bearer ' + tokens.access_token, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ name: 'HandyPay Deposits', description: 'Collect booking deposits automatically. Clients get an SMS payment link when they book.', paymentsUrl: process.env.APP_URL + '/api/pay', queryUrl: process.env.APP_URL + '/api/query', imageUrl: process.env.APP_URL + '/api/logo', supportsSubscriptionSchedule: false }) });
+      const provRes = await fetch('https://services.leadconnectorhq.com/payments/custom-provider/provider?locationId=' + tokens.locationId, { method: 'POST', headers: { 'Authorization': 'Bearer ' + tokens.access_token, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ name: 'HandyPay Deposits', description: 'Collect booking deposits automatically. Clients get an SMS payment link when they book.', paymentsUrl: process.env.APP_URL + '/api/pay', queryUrl: process.env.APP_URL + '/api/query', imageUrl: LOGO_URL, supportsSubscriptionSchedule: false }) });
       const provData = await provRes.json();
       console.log('Payment provider registered:', JSON.stringify(provData));
     } catch (provErr) { console.error('Provider registration failed (non-fatal):', provErr.message); }
     res.redirect('/api/settings?location_id=' + tokens.locationId + '&installed=true');
   } catch (err) { res.status(500).send('OAuth error: ' + err.message); }
 });
-app.get('/api/logo', (req, res) => { res.redirect('https://img.icons8.com/color/200/hand-holding-dollar.png'); });
+app.get('/api/logo', (req, res) => { res.redirect(LOGO_URL); });
 app.get('/api/pay', async (req, res) => {
   const { locationId } = req.query;
   let cfg = {};
