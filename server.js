@@ -64,10 +64,8 @@ app.post('/api/webhooks/crm', async (req, res) => {
     const sr = await fetch('https://api.handypay.me/api/v1/payment-sessions', { method: 'POST', headers: { 'Authorization': 'Bearer ' + cfg.handypay_api_key, 'Content-Type': 'application/json' }, body: JSON.stringify({ line_items: [{ price_data: { currency: 'jmd', product_data: { name: 'Deposit - ' + title }, unit_amount: dep * 100 }, quantity: 1 }], customer_email: e.contact?.email || undefined, success_url: cfg.success_url || process.env.APP_URL + '/success', cancel_url: cfg.cancel_url || process.env.APP_URL + '/cancel', metadata: { location_id: locId, contact_id: conId, appointment_title: title } }) });
     const sess = await sr.json();
     if (sess.url && cfg.crm_access_token) {
-      await fetch('https://services.leadconnectorhq.com/conversations/messages', { method: 'POST', headers: { 'Authorization': 'Bearer ' + cfg.crm_access_token, 'Content-Type': 'application/json', 'Version': '2021-04-15' }, body: JSON.stringify({ type: 'SMS', contactId: conId, message: 'Hi ' + fn + '! Pay your deposit (JMD $' + dep.toLocaleString() + ') to confirm ' + title + ':
-' + sess.url + '
-
-Expires in 24 hours.' }) });
+      const smsMsg = 'Hi ' + fn + '! Pay your deposit (JMD $' + dep.toLocaleString() + ') to confirm ' + title + ': ' + sess.url + ' - Link expires in 24 hours.';
+      await fetch('https://services.leadconnectorhq.com/conversations/messages', { method: 'POST', headers: { 'Authorization': 'Bearer ' + cfg.crm_access_token, 'Content-Type': 'application/json', 'Version': '2021-04-15' }, body: JSON.stringify({ type: 'SMS', contactId: conId, message: smsMsg }) });
       await fetch('https://services.leadconnectorhq.com/contacts/' + conId + '/notes', { method: 'POST', headers: { 'Authorization': 'Bearer ' + cfg.crm_access_token, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ body: 'Deposit link sent: JMD $' + dep.toLocaleString() + ' | Session: ' + sess.id }) });
     }
   } catch(err){ console.error('CRM webhook err:', err); }
