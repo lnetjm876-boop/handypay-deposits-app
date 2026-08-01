@@ -135,6 +135,7 @@ async function createHandyPaySession(apiKey, opts) {
       amount: amount,
       currency: currency.toLowerCase(),
       name: 'Appointment Deposit'
+      quantity: 1
     }],
     mode: 'payment',
     success_url: successUrl,
