@@ -132,12 +132,9 @@ async function createHandyPaySession(apiKey, opts) {
   // HandyPay (Stripe Connect) requires line_items format
   var payload = {
     line_items: [{
-      price_data: {
-        currency: currency.toLowerCase(),
-        unit_amount: amount,
-        product_data: { name: 'Appointment Deposit' }
-      },
-      quantity: 1
+      amount: amount,
+      currency: currency.toLowerCase(),
+      name: 'Appointment Deposit'
     }],
     mode: 'payment',
     success_url: successUrl,
