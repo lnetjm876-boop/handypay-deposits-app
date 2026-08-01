@@ -16,8 +16,26 @@ app.get('/api/oauth/callback', async (req, res) => {
     const tokens = await t.json();
     if (!tokens.access_token) return res.status(400).send('Token error: ' + JSON.stringify(tokens));
     await pool.query('INSERT INTO merchant_configs (location_id,crm_access_token,crm_refresh_token) VALUES ($1,$2,$3) ON CONFLICT (location_id) DO UPDATE SET crm_access_token=$2,crm_refresh_token=$3,updated_at=NOW()', [tokens.locationId, tokens.access_token, tokens.refresh_token]);
+    try {
+      const provRes = await fetch('https://services.leadconnectorhq.com/payments/custom-provider/provider?locationId=' + tokens.locationId, { method: 'POST', headers: { 'Authorization': 'Bearer ' + tokens.access_token, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ name: 'HandyPay Deposits', description: 'Collect booking deposits automatically. Clients get an SMS payment link when they book.', paymentsUrl: process.env.APP_URL + '/api/pay', queryUrl: process.env.APP_URL + '/api/query', imageUrl: process.env.APP_URL + '/api/logo', supportsSubscriptionSchedule: false }) });
+      const provData = await provRes.json();
+      console.log('Payment provider registered:', JSON.stringify(provData));
+    } catch (provErr) { console.error('Provider registration failed (non-fatal):', provErr.message); }
     res.redirect('/api/settings?location_id=' + tokens.locationId + '&installed=true');
   } catch (err) { res.status(500).send('OAuth error: ' + err.message); }
+});
+app.get('/api/logo', (req, res) => { res.redirect('https://img.icons8.com/color/200/hand-holding-dollar.png'); });
+app.get('/api/pay', async (req, res) => {
+  const { locationId } = req.query;
+  let cfg = {};
+  try { const { rows } = await pool.query('SELECT * FROM merchant_configs WHERE location_id=$1', [locationId]); if (rows.length) cfg = rows[0]; } catch(e){}
+  const dep = cfg.deposit_amount || 5000;
+  res.send('<html><head><title>HandyPay Deposit</title><style>body{font-family:sans-serif;max-width:500px;margin:40px auto;padding:20px;text-align:center}h2{color:#005DBD}.btn{background:#D10039;color:#fff;padding:12px 28px;border:none;border-radius:6px;font-size:16px;cursor:pointer;margin-top:20px;text-decoration:none;display:inline-block}</style></head><body><h2>HandyPay Deposits</h2><p>Deposit Amount: <strong>JMD $' + dep.toLocaleString() + '</strong></p><p style="color:#888;font-size:13px">A payment link will be sent via SMS to the client when an appointment is booked.</p><a class="btn" href="https://handypay.me" target="_blank">Open HandyPay Dashboard</a></body></html>');
+});
+app.post('/api/query', async (req, res) => {
+  const body = Buffer.isBuffer(req.body) ? JSON.parse(req.body.toString()) : req.body;
+  console.log('CRM payment query:', JSON.stringify(body));
+  res.json({ status: 'ok', received: true });
 });
 app.get('/api/settings', async (req, res) => {
   const { location_id } = req.query;
@@ -63,10 +81,10 @@ app.post('/api/webhooks/crm', async (req, res) => {
     const cfg = rows[0], dep = cfg.deposit_amount || 5000;
     const sr = await fetch('https://api.handypay.me/api/v1/payment-sessions', { method: 'POST', headers: { 'Authorization': 'Bearer ' + cfg.handypay_api_key, 'Content-Type': 'application/json' }, body: JSON.stringify({ line_items: [{ name: 'Deposit - ' + title, amount: dep * 100, currency: 'jmd', quantity: 1 }], customer_email: e.contact?.email || undefined, success_url: cfg.success_url || process.env.APP_URL + '/success', cancel_url: cfg.cancel_url || process.env.APP_URL + '/cancel', metadata: { location_id: locId, contact_id: conId, appointment_title: title } }) });
     const sess = await sr.json();
-    if (sess.data?.url||sess.url && cfg.crm_access_token) {
-      const smsMsg = 'Hi ' + fn + '! Pay your deposit (JMD $' + dep.toLocaleString() + ') to confirm ' + title + ': ' + sess.data?.url||sess.url + ' - Link expires in 24 hours.';
+    if ((sess.data?.url || sess.url) && cfg.crm_access_token) {
+      const smsMsg = 'Hi ' + fn + '! Pay your deposit (JMD $' + dep.toLocaleString() + ') to confirm ' + title + ': ' + (sess.data?.url || sess.url) + ' - Link expires in 24 hours.';
       await fetch('https://services.leadconnectorhq.com/conversations/messages', { method: 'POST', headers: { 'Authorization': 'Bearer ' + cfg.crm_access_token, 'Content-Type': 'application/json', 'Version': '2021-04-15' }, body: JSON.stringify({ type: 'SMS', contactId: conId, message: smsMsg }) });
-      await fetch('https://services.leadconnectorhq.com/contacts/' + conId + '/notes', { method: 'POST', headers: { 'Authorization': 'Bearer ' + cfg.crm_access_token, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ body: 'Deposit link sent: JMD $' + dep.toLocaleString() + ' | Session: ' + sess.data?.id||sess.id }) });
+      await fetch('https://services.leadconnectorhq.com/contacts/' + conId + '/notes', { method: 'POST', headers: { 'Authorization': 'Bearer ' + cfg.crm_access_token, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ body: 'Deposit link sent: JMD $' + dep.toLocaleString() + ' | Session: ' + (sess.data?.id || sess.id) }) });
     }
   } catch(err){ console.error('CRM webhook err:', err); }
   res.json({ received: true });
@@ -83,8 +101,7 @@ app.post('/api/session', async (req, res) => {
     else { ep = 'https://api.handypay.me/api/v1/payment-sessions'; body = { line_items: [{ name: description || 'Deposit Payment', amount: dep * 100, currency: 'jmd', quantity: 1 }], success_url: cfg.success_url || process.env.APP_URL + '/success', cancel_url: cfg.cancel_url || process.env.APP_URL + '/cancel', metadata: { location_id, contact_id } }; }
     const sr = await fetch(ep, { method: 'POST', headers: { 'Authorization': 'Bearer ' + cfg.handypay_api_key, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const sess = await sr.json();
-    if (!sess.data?.url||sess.url) return res.status(500).json({ error: 'No URL', details: sess });
-    res.json({ url: sess.data?.url||sess.url, session_id: sess.data?.id||sess.id, amount_jmd: dep });
+    res.json({ url: sess.data?.url || sess.url, session_id: sess.data?.id || sess.id, amount_jmd: dep });
   } catch(err){ res.status(500).json({ error: err.message }); }
 });
 app.get('/api/init-db', async (req, res) => {
