@@ -519,6 +519,7 @@ app.get('/api/init-db', async (req, res) => {
       ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS appointment_id VARCHAR(255);
       ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS access_token TEXT;
       ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+      ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS session_id VARCHAR(255);
       CREATE UNIQUE INDEX IF NOT EXISTS payment_logs_session_id_idx ON payment_logs(session_id);
     `);
     res.json({ ok: true, message: 'DB initialized/migrated.' });
