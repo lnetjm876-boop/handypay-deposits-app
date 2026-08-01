@@ -285,12 +285,17 @@ app.post('/api/settings', async (req, res) => {
 app.post('/api/webhooks/crm', async (req, res) => {
   var raw = Buffer.isBuffer(req.body) ? req.body.toString() : JSON.stringify(req.body);
   var body = Buffer.isBuffer(req.body) ? JSON.parse(raw) : req.body;
-  var type = body.type;
-  var locationId = body.locationId;
-  var contactId = body.contactId;
-  var appointmentId = body.id;
-  var startTime = body.startTime;
-  var title = body.title;
+
+  // CRM workflow webhooks wrap custom data under "customData" key
+  var cd = body.customData || {};
+  console.log('[CRM webhook] FULL BODY:', JSON.stringify(body).substring(0, 600));
+
+  var type = body.type || cd.type;
+  var locationId = body.locationId || cd.locationId || body.location_id || cd.location_id;
+  var contactId = body.contactId || cd.contactId || (body.contact && body.contact.id);
+  var appointmentId = body.id || cd.appointmentId || body.appointmentId;
+  var startTime = body.startTime || cd.startTime;
+  var title = body.title || cd.title;
 
   console.log('[CRM webhook] type:', type, '| loc:', locationId, '| contact:', contactId);
 
