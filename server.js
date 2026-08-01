@@ -71,7 +71,13 @@ app.get('/api/oauth/callback', async (req, res) => {
 });
 
 app.get('/api/settings', async (req, res) => {
-  const { location_id } = req.query;
+  let { location_id } = req.query;
+  if (!location_id) {
+    const referer = req.headers['referer'] || req.headers['referrer'] || '';
+    const m = referer.match(/\/location\/([a-zA-Z0-9]+)[\/]/);
+    if (m) location_id = m[1];
+    console.log('[settings] location_id from referer:', location_id, '| referer:', referer.substring(0,80));
+  }
   if (!location_id) return res.status(400).send('Missing location_id');
   let c = {};
   try { const { rows } = await pool.query('SELECT * FROM merchant_configs WHERE location_id=$1', [location_id]); if (rows.length) c = rows[0]; } catch(e){}
