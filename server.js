@@ -54,14 +54,14 @@ app.post('/api/webhooks/handypay', async (req, res) => {
   res.json({ received: true });
 });
 app.post('/api/webhooks/crm', async (req, res) => {
-  const e = req.body;
+  const e = Buffer.isBuffer(req.body) ? JSON.parse(req.body.toString()) : req.body;
   if (e.type !== 'AppointmentCreate') return res.json({ skipped: e.type });
   try {
     const locId = e.locationId, conId = e.contactId || e.contact?.id, fn = e.contact?.firstName || 'there', title = e.appointment?.title || 'Your Appointment';
     const { rows } = await pool.query('SELECT * FROM merchant_configs WHERE location_id=$1', [locId]);
     if (!rows.length || !rows[0].handypay_api_key) return res.json({ skipped: 'no-config' });
     const cfg = rows[0], dep = cfg.deposit_amount || 5000;
-    const sr = await fetch('https://api.handypay.me/api/v1/payment-sessions', { method: 'POST', headers: { 'Authorization': 'Bearer ' + cfg.handypay_api_key, 'Content-Type': 'application/json' }, body: JSON.stringify({ line_items: [{ price_data: { currency: 'jmd', product_data: { name: 'Deposit - ' + title }, unit_amount: dep * 100 }, quantity: 1 }], customer_email: e.contact?.email || undefined, success_url: cfg.success_url || process.env.APP_URL + '/success', cancel_url: cfg.cancel_url || process.env.APP_URL + '/cancel', metadata: { location_id: locId, contact_id: conId, appointment_title: title } }) });
+    const sr = await fetch('https://api.handypay.me/api/v1/payment-sessions', { method: 'POST', headers: { 'Authorization': 'Bearer ' + cfg.handypay_api_key, 'Content-Type': 'application/json' }, body: JSON.stringify({ line_items: [{ name: 'Deposit - ' + title, amount: dep * 100, currency: 'jmd' }], customer_email: e.contact?.email || undefined, success_url: cfg.success_url || process.env.APP_URL + '/success', cancel_url: cfg.cancel_url || process.env.APP_URL + '/cancel', metadata: { location_id: locId, contact_id: conId, appointment_title: title } }) });
     const sess = await sr.json();
     if (sess.url && cfg.crm_access_token) {
       const smsMsg = 'Hi ' + fn + '! Pay your deposit (JMD $' + dep.toLocaleString() + ') to confirm ' + title + ': ' + sess.url + ' - Link expires in 24 hours.';
@@ -80,7 +80,7 @@ app.post('/api/session', async (req, res) => {
     const cfg = rows[0], dep = amount || cfg.deposit_amount || 5000;
     let ep, body;
     if (type === 'subscription' && price_id) { ep = 'https://api.handypay.me/api/v1/subscription-sessions'; body = { price_id, success_url: cfg.success_url || process.env.APP_URL + '/success', cancel_url: cfg.cancel_url || process.env.APP_URL + '/cancel', metadata: { location_id, contact_id } }; }
-    else { ep = 'https://api.handypay.me/api/v1/payment-sessions'; body = { line_items: [{ price_data: { currency: 'jmd', product_data: { name: description || 'Deposit Payment' }, unit_amount: dep * 100 }, quantity: 1 }], success_url: cfg.success_url || process.env.APP_URL + '/success', cancel_url: cfg.cancel_url || process.env.APP_URL + '/cancel', metadata: { location_id, contact_id } }; }
+    else { ep = 'https://api.handypay.me/api/v1/payment-sessions'; body = { line_items: [{ name: description || 'Deposit Payment', amount: dep * 100, currency: 'jmd' }], success_url: cfg.success_url || process.env.APP_URL + '/success', cancel_url: cfg.cancel_url || process.env.APP_URL + '/cancel', metadata: { location_id, contact_id } }; }
     const sr = await fetch(ep, { method: 'POST', headers: { 'Authorization': 'Bearer ' + cfg.handypay_api_key, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const sess = await sr.json();
     if (!sess.url) return res.status(500).json({ error: 'No URL', details: sess });
