@@ -379,13 +379,7 @@ app.post('/api/webhooks/crm', async (req, res) => {
         .replace('{date}', apptDate)
         .replace('{link}', paymentUrl);
     } else {
-      sms = 'Hi ' + firstName + '! Your appointment for ' + apptDate + ' has been requested.
-
-Pay your deposit of JMD $' + depositAmount.toLocaleString() + ' to confirm your spot:
-
-' + paymentUrl + '
-
-Link expires in 24 hours.';
+      sms = 'Hi ' + firstName + '! Your appointment for ' + apptDate + ' has been requested.\n\nPay your deposit of JMD $' + depositAmount.toLocaleString() + ' to confirm your spot:\n\n' + paymentUrl + '\n\nLink expires in 24 hours.';
     }
 
     await sendSms(accessToken, locationId, contactId, sms);
@@ -439,11 +433,7 @@ app.post('/api/webhooks/handypay', async (req, res) => {
 
     await addContactTag(accessToken, contactId, ['deposit-paid']);
     await addContactNote(accessToken, contactId,
-      'Deposit Received
-Amount: JMD $' + ((amount || amountReceived || 0)).toLocaleString() + '
-Session: ' + sessionId + '
-Appointment: ' + (appointmentId || 'N/A') + '
-Powered by HandyPay'
+      'Deposit Received\nAmount: JMD $' + ((amount || amountReceived || 0)).toLocaleString() + '\nSession: ' + sessionId + '\nAppointment: ' + (appointmentId || 'N/A') + '\nPowered by HandyPay'
     );
     await updatePaymentLogStatus(sessionId, 'paid');
     console.log('[hp webhook] Deposit confirmed | contact:', contactId, '| JMD', amount);
