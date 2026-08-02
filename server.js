@@ -34,6 +34,12 @@ app.get('/cancel', (req, res) => {
   res.send('<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Payment Cancelled</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#fff7f7;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}.card{background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(0,0,0,.08);max-width:420px;width:100%;padding:40px;text-align:center}.icon{font-size:64px;margin-bottom:16px}h1{font-size:22px;font-weight:800;color:#b91c1c;margin-bottom:10px}p{font-size:15px;color:#555;line-height:1.6}.sub{font-size:13px;color:#888;margin-top:20px}</style></head><body><div class="card"><div class="icon">\u274C</div><h1>Payment Cancelled</h1><p>Your payment was not completed. Your appointment spot is not yet secured.</p><p>Please use the link in your SMS to try again.</p><p class="sub">You can close this window.</p></div></body></html>');
 });
 
+app.get('/api/logs', async (req, res) => {
+  if(req.query.secret !== process.env.INIT_SECRET) return res.status(403).json({error:'forbidden'});
+  var rows = (await pool.query('SELECT session_id,contact_id,location_id,amount,payment_type,status,created_at FROM payment_logs ORDER BY created_at DESC LIMIT 20')).rows;
+  res.json({ count: rows.length, logs: rows });
+});
+
 app.get('/api/health', (req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }));
 app.get('/api/logo', (req, res) => res.redirect(LOGO_URL));
 
