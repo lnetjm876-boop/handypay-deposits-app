@@ -382,16 +382,30 @@ app.post('/api/webhooks/handypay', async (req, res) => {
   res.json({ ok: true });
 
   try {
+    // Primary: read from session metadata (works even if DB log is missing)
+    var contactId   = (obj.metadata && obj.metadata.contactId)   || null;
+    var locationId  = (obj.metadata && obj.metadata.locationId)  || null;
+    var payType2    = (obj.metadata && obj.metadata.paymentType) || 'deposit';
+    var apptMetaId  = (obj.metadata && obj.metadata.appointmentId) || '';
+    var amountJMD   = amountReceived ? Math.round(amountReceived / 100) : 0;
+    var config2     = (contactId && locationId) ? await getMerchantConfig(locationId) : null;
+    var accessToken = config2 && config2.crm_access_token;
+    // Fallback: read from DB log if metadata missing
     var log = await getPaymentLogBySession(sessionId);
-    if (!log) { console.error('[hp webhook] No log for session:', sessionId); return; }
+    if (!contactId || !accessToken) {
+      if (!log) { console.error('[hp webhook] No metadata and no DB log for:', sessionId); return; }
+      contactId   = contactId   || log.contact_id;
+      locationId  = locationId  || log.location_id;
+      accessToken = accessToken || log.access_token;
+      payType2    = payType2 !== 'deposit' ? payType2 : (log.payment_type || 'deposit');
+      apptMetaId  = apptMetaId || log.appointment_id || '';
+      amountJMD   = amountJMD  || log.amount || 0;
+    }
+    var amount = amountJMD;
+    var appointmentId = apptMetaId;
 
-    var contactId = log.contact_id;
-    var accessToken = log.access_token;
-    var amount = log.amount;
-    var locationId = log.location_id;
-    var appointmentId = log.appointment_id;
-
-    await addContactTag(accessToken, contactId, ['deposit-paid']);
+    var tagLabel = payType2 === 'full' ? 'paid-in-full' : 'deposit-paid';
+    await addContactTag(accessToken, contactId, [tagLabel]);
     await addContactNote(accessToken, contactId,
       'Deposit Received\nAmount: JMD $' + ((amount || amountReceived || 0)).toLocaleString() + '\nSession: ' + sessionId + '\nAppointment: ' + (appointmentId || 'N/A') + '\nPowered by HandyPay'
     );
