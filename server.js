@@ -304,7 +304,8 @@ app.post('/api/webhooks/crm', async (req, res) => {
   var fullAmt = appointmentTotal;
   var firstName = contactName.split(' ')[0];
   var dateStr = (function(iso){ if(!iso) return 'your appointment'; try{ return new Date(iso).toLocaleString('en-US',{weekday:'long',month:'long',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true}); } catch(e){ return iso; } })(startTime);
-  var meta = { locationId:locationId, contactId:contactId, title:title, startTime:startTime };
+  var appointmentId = body.appointmentId||(body.customData&&body.customData.appointmentId)||'';
+  var meta = { locationId:locationId, contactId:contactId, title:title, startTime:startTime, appointmentId:appointmentId };
   var depositSession, fullSession, smsMessage;
   try {
     if(hasTotal) {
@@ -376,6 +377,22 @@ app.post('/api/webhooks/handypay', async (req, res) => {
       'Deposit Received\nAmount: JMD $' + ((amount || amountReceived || 0)).toLocaleString() + '\nSession: ' + sessionId + '\nAppointment: ' + (appointmentId || 'N/A') + '\nPowered by HandyPay'
     );
     await updatePaymentLogStatus(sessionId, 'paid');
+    // Determine payment type (deposit or full)
+    var payType = (obj.metadata && obj.metadata.paymentType) || (log && log.payment_type) || 'deposit';
+    if(payType === 'full') { await addContactTag(accessToken, contactId, ['paid-in-full']); }
+    // Confirm appointment in CRM so reminder workflows fire
+    var apptCrmId = (obj.metadata && obj.metadata.appointmentId) || appointmentId || '';
+    if(apptCrmId) {
+      try {
+        var ar = await fetch(GHL_API + '/calendars/events/appointments/' + apptCrmId, {
+          method: 'PUT',
+          headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-04-15' },
+          body: JSON.stringify({ appointmentStatus: 'confirmed' })
+        });
+        var ad = await ar.json();
+        console.log('[Confirm Appt]', apptCrmId, ar.status, JSON.stringify(ad).substring(0,100));
+      } catch(e) { console.error('[Confirm Appt]', e.message); }
+    }
     console.log('[hp webhook] Deposit confirmed | contact:', contactId, '| JMD', amount);
   } catch (err) {
     console.error('[hp webhook ERROR]', err.message);
