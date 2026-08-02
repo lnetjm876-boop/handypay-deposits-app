@@ -125,39 +125,26 @@ async function addContactNote(accessToken, contactId, body) {
 // ============================================================
 // HANDYPAY HELPERS
 // ============================================================
-async function createHandyPaySession(apiKey, opts) {
-  var amount = opts.amount, currency = opts.currency || 'JMD',
-      contact = opts.contact || {}, metadata = opts.metadata || {},
-      successUrl = opts.successUrl, cancelUrl = opts.cancelUrl;
-  // HandyPay (Stripe Connect) requires line_items format
+async function createHandyPaySession(apiKey, amountJMD, label, meta) {
   var payload = {
-    line_items: [{
-      amount: amount * 100, // JMD uses cents (smallest unit)
-      currency: currency.toLowerCase(),
-      name: 'Appointment Deposit',
-      quantity: 1
-    }],
+    line_items: [{ amount: Math.round(amountJMD) * 100, currency: 'jmd', name: label, quantity: 1 }],
     mode: 'payment',
-    success_url: successUrl,
-    cancel_url: cancelUrl,
-    metadata: metadata
+    success_url: APP_URL + '/success',
+    cancel_url: APP_URL + '/cancel',
+    metadata: meta
   };
-  if (contact.email) payload.customer_email = contact.email;
-  if (contact.name) payload.customer_name = contact.name;
-  console.log('[HandyPay] Creating session, amount:', amount, currency);
   var r = await fetch(HP_BASE + '/payment-sessions', {
     method: 'POST',
     headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   });
   var text = await r.text();
-  console.log('[HandyPay] Session response:', r.status, text.substring(0, 300));
-  if (!r.ok) throw new Error('HandyPay session ' + r.status + ': ' + text);
+  console.log('[HandyPay]', r.status, text.substring(0, 200));
+  if (!r.ok) throw new Error('HandyPay ' + r.status + ': ' + text);
   var parsed = JSON.parse(text);
-  return parsed.data || parsed; // HandyPay wraps in {success,data}
+  return parsed.data || parsed;
 }
 
-// ============================================================
 // PAYMENT PROVIDER REGISTRATION
 // ============================================================
 async function registerPaymentProvider(locationId, accessToken) {
@@ -293,123 +280,61 @@ app.post('/api/settings', async (req, res) => {
 // CRM APPOINTMENT WEBHOOK  <-- THE DEPOSIT TRIGGER
 // ============================================================
 app.post('/api/webhooks/crm', async (req, res) => {
-  var raw = Buffer.isBuffer(req.body) ? req.body.toString() : JSON.stringify(req.body);
-  var body = Buffer.isBuffer(req.body) ? JSON.parse(raw) : req.body;
-
-  // CRM workflow webhooks wrap custom data under "customData" key
-  var cd = body.customData || {};
-  console.log('[CRM webhook] FULL BODY:', JSON.stringify(body).substring(0, 600));
-
-  var type = body.type || cd.type;
-  var locationId = body.locationId || cd.locationId || body.location_id || cd.location_id;
-  var contactId = body.contactId || cd.contactId || (body.contact && body.contact.id);
-  var appointmentId = body.id || cd.appointmentId || body.appointmentId;
-  var startTime = body.startTime || cd.startTime;
-  var title = body.title || cd.title;
-
-  console.log('[CRM webhook] type:', type, '| loc:', locationId, '| contact:', contactId);
-
-  var isAppt = !type || ['AppointmentCreate', 'appointmentCreate', 'appointment.create'].indexOf(type) !== -1;
-  if (!isAppt) return res.json({ ok: true, skipped: type });
-
+  var rawBody = req.body; var body;
+  try { body = typeof rawBody==='string' ? JSON.parse(rawBody) : (Buffer.isBuffer(rawBody) ? JSON.parse(rawBody.toString()) : rawBody); } catch(e) { body = rawBody; }
+  console.log('[CRM Webhook]', JSON.stringify(body));
+  var locationId = body.locationId||(body.customData&&body.customData.locationId);
+  var contactId  = body.contactId ||(body.customData&&body.customData.contactId);
+  var contactName= body.contactName||(body.customData&&body.customData.contactName)||'there';
+  var startTime  = body.startTime  ||(body.customData&&body.customData.startTime);
+  var title      = body.title      ||(body.customData&&body.customData.title)||'appointment';
+  var appointmentTotal = parseFloat(body.appointmentTotal||(body.customData&&body.customData.appointmentTotal)||0);
+  if(!locationId||!contactId) return res.json({ok:false,error:'missing_fields'});
+  var config = await getMerchantConfig(locationId);
+  if(!config) return res.json({ok:false,error:'no_config'});
+  var token = config.crm_access_token;
+  if(!token) return res.json({ok:false,error:'no_token'});
+  var contact;
+  try { contact = await getContact(token, contactId); }
+  catch(e) { console.error('[getContact]',e.message); return res.json({ok:false,error:'contact_fetch_failed'}); }
+  if(!contact||!contact.phone) return res.json({ok:false,error:'no_phone'});
+  var pct = config.deposit_percentage || 30;
+  var hasTotal = appointmentTotal > 0;
+  var depositAmt = hasTotal ? Math.round(appointmentTotal * pct / 100) : (config.deposit_amount || 0);
+  var fullAmt = appointmentTotal;
+  var firstName = contactName.split(' ')[0];
+  var dateStr = (function(iso){ if(!iso) return 'your appointment'; try{ return new Date(iso).toLocaleString('en-US',{weekday:'long',month:'long',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true}); } catch(e){ return iso; } })(startTime);
+  var meta = { locationId:locationId, contactId:contactId, title:title, startTime:startTime };
+  var depositSession, fullSession, smsMessage;
   try {
-    var config = await getMerchantConfig(locationId);
-    if (!config) return res.json({ ok: true, note: 'no_config' });
-    if (!config.handypay_api_key || config.handypay_api_key === 'hp_pending_setup')
-      return res.json({ ok: true, note: 'api_key_not_set' });
-    if (!config.deposit_amount || config.deposit_amount < 100)
-      return res.json({ ok: true, note: 'deposit_amount_not_set' });
-    if (!contactId) return res.json({ ok: true, note: 'no_contact_id' });
-
-    var accessToken = config.crm_access_token;
-    var contact = body.contact || {};
-
-    // Fetch full contact details
-    if (accessToken && (!contact.phone || !contact.firstName)) {
-      try {
-        var c = await getContact(accessToken, contactId);
-        contact = Object.assign({}, c, contact);
-      } catch (e) {
-        try {
-          accessToken = await refreshCrmToken(locationId);
-          var c2 = await getContact(accessToken, contactId);
-          contact = Object.assign({}, c2, contact);
-        } catch (e2) { console.error('[webhook] contact fetch failed:', e2.message); }
-      }
-    }
-
-    var phone = contact.phone || contact.phoneRaw;
-    if (!phone) {
-      console.error('[webhook] Contact', contactId, 'has no phone number -- skipping SMS');
-      return res.json({ ok: true, note: 'no_phone' });
-    }
-
-    var firstName = contact.firstName || 'there';
-    var depositAmount = config.deposit_amount;
-
-    var apptDate = 'your upcoming appointment';
-    if (startTime) {
-      try {
-        apptDate = new Date(startTime).toLocaleDateString('en-JM', {
-          weekday: 'long', month: 'long', day: 'numeric',
-          hour: '2-digit', minute: '2-digit', timeZone: 'America/Jamaica'
-        });
-      } catch (e) { apptDate = startTime; }
-    }
-
-    console.log('[webhook] Creating HandyPay session -- JMD', depositAmount);
-    var session = await createHandyPaySession(config.handypay_api_key, {
-      amount: depositAmount,
-      currency: 'JMD',
-      contact: { name: firstName, email: contact.email, phone: phone },
-      metadata: {
-        contact_id: contactId, location_id: locationId,
-        appointment_id: appointmentId || '', title: title || ''
-      },
-      successUrl: APP_URL + '/api/payment-success?session_id={CHECKOUT_SESSION_ID}',
-      cancelUrl: APP_URL + '/api/payment-cancel'
-    });
-
-    var paymentUrl = session.url || session.payment_url || session.checkout_url || session.checkoutUrl;
-    var sessionId = session.id || session.session_id || session.sessionId;
-
-    if (!paymentUrl) {
-      console.error('[webhook] No payment URL -- HandyPay response:', JSON.stringify(session));
-      return res.json({ ok: false, error: 'No payment URL from HandyPay', raw: session });
-    }
-
-    // Log to DB
-    await pool.query(
-      'INSERT INTO payment_logs (location_id,session_id,contact_id,appointment_id,amount,currency,status,access_token,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()) ON CONFLICT (session_id) DO NOTHING',
-      [locationId, sessionId, contactId, appointmentId || '', depositAmount, 'JMD', 'pending', accessToken]
-    );
-
-    // Build SMS message
-    var tmpl = config.sms_template;
-    var sms;
-    if (tmpl) {
-      sms = tmpl
-        .replace('{name}', firstName)
-        .replace('{amount}', depositAmount.toLocaleString())
-        .replace('{date}', apptDate)
-        .replace('{link}', paymentUrl);
+    if(hasTotal) {
+      var sessions = await Promise.all([
+        createHandyPaySession(config.handypay_api_key, depositAmt, pct+'% Deposit - '+title, Object.assign({},meta,{paymentType:'deposit'})),
+        createHandyPaySession(config.handypay_api_key, fullAmt, 'Full Payment - '+title, Object.assign({},meta,{paymentType:'full'}))
+      ]);
+      depositSession = sessions[0]; fullSession = sessions[1];
+      smsMessage = 'Hi '+firstName+'! Your '+title+' on '+dateStr+' needs payment to confirm your spot.\n\n'+
+        'Choose your option:\n\n'+
+        '\uD83D\uDCB3 Pay '+pct+'% deposit - JMD $'+depositAmt.toLocaleString()+':\n'+depositSession.url+'\n\n'+
+        '\u2705 Pay in full - JMD $'+fullAmt.toLocaleString()+':\n'+fullSession.url+'\n\nLinks expire in 24 hours.';
     } else {
-      sms = 'Hi ' + firstName + '! Your appointment for ' + apptDate + ' has been requested.\n\nPay your deposit of JMD $' + depositAmount.toLocaleString() + ' to confirm your spot:\n\n' + paymentUrl + '\n\nLink expires in 24 hours.';
+      depositSession = await createHandyPaySession(config.handypay_api_key, depositAmt, 'Deposit - '+title, Object.assign({},meta,{paymentType:'deposit'}));
+      smsMessage = 'Hi '+firstName+'! Your '+title+' on '+dateStr+' needs a deposit of JMD $'+depositAmt.toLocaleString()+' to confirm.\n\n'+depositSession.url+'\n\nLink expires in 24 hours.';
     }
-
-    await sendSms(accessToken, locationId, contactId, sms);
-    console.log('[webhook] Deposit SMS sent | session:', sessionId, '| contact:', contactId);
-
-    res.json({ ok: true, sessionId: sessionId, smsStatus: 'sent' });
-  } catch (err) {
-    console.error('[CRM webhook ERROR]', err.message, err.stack);
-    res.json({ ok: false, error: err.message });
+  } catch(err) {
+    console.error('[HandyPay]',err.message);
+    return res.status(500).json({ok:false,error:'handypay_failed',detail:err.message});
   }
+  try {
+    await pool.query('INSERT INTO payment_logs (session_id,contact_id,location_id,appointment_id,amount,currency,status,access_token,payment_type) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (session_id) DO NOTHING',
+      [depositSession.id,contactId,locationId,title,depositAmt,'jmd','pending',token,'deposit']);
+    if(fullSession) await pool.query('INSERT INTO payment_logs (session_id,contact_id,location_id,appointment_id,amount,currency,status,access_token,payment_type) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (session_id) DO NOTHING',
+      [fullSession.id,contactId,locationId,title,fullAmt,'jmd','pending',token,'full']);
+  } catch(err){ console.error('[DB]',err.message); }
+  var smsStatus = 'failed';
+  try { await sendSms(token,locationId,contactId,smsMessage); smsStatus='sent'; } catch(err){ console.error('[SMS]',err.message); }
+  res.json({ok:true,depositSessionId:depositSession.id,fullSessionId:fullSession?fullSession.id:null,smsStatus:smsStatus});
 });
-
-// ============================================================
-// HANDYPAY PAYMENT WEBHOOK  <-- CONFIRM DEPOSIT
-// ============================================================
 app.post('/api/webhooks/handypay', async (req, res) => {
   var raw = Buffer.isBuffer(req.body) ? req.body.toString() : JSON.stringify(req.body);
   var sig = req.headers['handypay-signature'] || req.headers['stripe-signature'] || req.headers['x-handypay-signature'] || '';
