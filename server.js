@@ -345,7 +345,15 @@ app.post('/api/webhooks/crm', async (req, res) => {
   if(!token) return res.json({ok:false,error:'no_token'});
   var contact;
   try { contact = await getContact(token, contactId); }
-  catch(e) { console.error('[getContact]',e.message); return res.json({ok:false,error:'contact_fetch_failed'}); }
+  catch(e) {
+    console.log('[getContact] failed, trying token refresh:', e.message);
+    try {
+      token = await refreshCrmToken(locationId);
+      // Update token in DB
+      await pool.query('UPDATE merchant_configs SET crm_access_token=$1, updated_at=NOW() WHERE location_id=$2', [token, locationId]);
+      contact = await getContact(token, contactId);
+    } catch(e2) { console.error('[getContact after refresh]',e2.message); return res.json({ok:false,error:'contact_fetch_failed'}); }
+  }
   if(!contact||!contact.phone) return res.json({ok:false,error:'no_phone'});
   var pct = config.deposit_percentage || 30;
   var hasTotal = appointmentTotal > 0;
