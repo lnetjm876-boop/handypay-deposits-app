@@ -34,6 +34,16 @@ app.get('/cancel', (req, res) => {
   res.send('<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Payment Cancelled</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#fff7f7;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}.card{background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(0,0,0,.08);max-width:420px;width:100%;padding:40px;text-align:center}.icon{font-size:64px;margin-bottom:16px}h1{font-size:22px;font-weight:800;color:#b91c1c;margin-bottom:10px}p{font-size:15px;color:#555;line-height:1.6}.sub{font-size:13px;color:#888;margin-top:20px}</style></head><body><div class="card"><div class="icon">\u274C</div><h1>Payment Cancelled</h1><p>Your payment was not completed. Your appointment spot is not yet secured.</p><p>Please use the link in your SMS to try again.</p><p class="sub">You can close this window.</p></div></body></html>');
 });
 
+app.get('/p/:code', async (req, res) => {
+  var sc = req.params.code;
+  try {
+    var row = (await pool.query('SELECT full_url FROM short_links WHERE code=$1', [sc])).rows[0];
+    if(!row) return res.status(404).send('<h2 style="font-family:sans-serif;margin:40px">Link not found or expired.</h2>');
+    pool.query('UPDATE short_links SET clicks=clicks+1 WHERE code=$1', [sc]).catch(function(){});
+    return res.redirect(302, row.full_url);
+  } catch(e) { return res.status(500).send('Error: '+e.message); }
+});
+
 app.get('/api/logs', async (req, res) => {
   if(req.query.secret !== process.env.INIT_SECRET) return res.status(403).json({error:'forbidden'});
   var rows = (await pool.query('SELECT session_id,contact_id,location_id,amount,payment_type,status,created_at FROM payment_logs ORDER BY created_at DESC LIMIT 20')).rows;
@@ -112,7 +122,7 @@ async function sendSms(accessToken, locationId, contactId, message) {
   const mr = await fetch(GHL_API + '/conversations/messages', {
     method: 'POST',
     headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-04-15' },
-    body: JSON.stringify({ type: 'SMS', message: message, conversationId: conversationId, contactId: contactId })
+    body: JSON.stringify({ type: 'TYPE_WHATSAPP', message: message, conversationId: conversationId, contactId: contactId })
   });
   if (!mr.ok) {
     const errText = await mr.text();
@@ -139,6 +149,26 @@ async function addContactNote(accessToken, contactId, body) {
   });
   if (!r.ok) console.error('[note] failed:', r.status);
   return r.json().catch(function() {});
+}
+
+// ============================================================
+// SHORT LINK HELPERS
+// ============================================================
+function generateCode() {
+  var c = 'abcdefghjkmnpqrstuvwxyz23456789';
+  var code = ''; for(var i=0;i<6;i++) code += c[Math.floor(Math.random()*c.length)];
+  return code;
+}
+async function createShortLink(fullUrl, sessionId, locationId, contactId, paymentType) {
+  for(var attempt=0; attempt<10; attempt++) {
+    var sc = generateCode();
+    try {
+      await pool.query('INSERT INTO short_links (code,full_url,session_id,location_id,contact_id,payment_type) VALUES ($1,$2,$3,$4,$5,$6)',
+        [sc, fullUrl, sessionId, locationId, contactId, paymentType]);
+      return APP_URL + '/p/' + sc;
+    } catch(e) { if((e.code||'') !== '23505') throw e; }
+  }
+  return fullUrl; // fallback to full URL if all codes collide
 }
 
 // ============================================================
@@ -333,13 +363,18 @@ app.post('/api/webhooks/crm', async (req, res) => {
         createHandyPaySession(config.handypay_api_key, fullAmt, 'Full Payment - '+title, Object.assign({},meta,{paymentType:'full'}))
       ]);
       depositSession = sessions[0]; fullSession = sessions[1];
-      smsMessage = 'Hi '+firstName+'! Your '+title+' on '+dateStr+' needs payment to confirm your spot.\n\n'+
-        'Choose your option:\n\n'+
-        '\uD83D\uDCB3 Pay '+pct+'% deposit - JMD $'+depositAmt.toLocaleString()+':\n'+depositSession.url+'\n\n'+
-        '\u2705 Pay in full - JMD $'+fullAmt.toLocaleString()+':\n'+fullSession.url+'\n\nLinks expire in 24 hours.';
+      var dLink = await createShortLink(depositSession.url, depositSession.id, locationId, contactId, 'deposit');
+      var fLink = await createShortLink(fullSession.url,    fullSession.id,    locationId, contactId, 'full');
+      smsMessage = 'Hi '+firstName+'! '+title+' booked for '+dateStr+'.\n\n'+
+        'Confirm your spot with payment:\n\n'+
+        '\uD83D\uDCB3 Deposit ('+pct+'%) - JMD $'+depositAmt.toLocaleString()+'\n'+dLink+'\n\n'+
+        '\u2705 Pay in full - JMD $'+fullAmt.toLocaleString()+'\n'+fLink+'\n\n'+
+        'Links good for 24 hours.';
     } else {
       depositSession = await createHandyPaySession(config.handypay_api_key, depositAmt, 'Deposit - '+title, Object.assign({},meta,{paymentType:'deposit'}));
-      smsMessage = 'Hi '+firstName+'! Your '+title+' on '+dateStr+' needs a deposit of JMD $'+depositAmt.toLocaleString()+' to confirm.\n\n'+depositSession.url+'\n\nLink expires in 24 hours.';
+      var dLink = await createShortLink(depositSession.url, depositSession.id, locationId, contactId, 'deposit');
+      smsMessage = 'Hi '+firstName+'! '+title+' booked for '+dateStr+'.\n\nPay deposit to confirm your spot:\n\n'+
+        '\uD83D\uDCB3 JMD $'+depositAmt.toLocaleString()+'\n'+dLink+'\n\nLink good for 24 hours.';
     }
   } catch(err) {
     console.error('[HandyPay]',err.message);
@@ -354,6 +389,58 @@ app.post('/api/webhooks/crm', async (req, res) => {
   var smsStatus = 'failed';
   try { await sendSms(token,locationId,contactId,smsMessage); smsStatus='sent'; } catch(err){ console.error('[SMS]',err.message); }
   res.json({ok:true,depositSessionId:depositSession.id,fullSessionId:fullSession?fullSession.id:null,smsStatus:smsStatus});
+});
+app.post('/api/webhooks/followup', async (req, res) => {
+  var b = req.body;
+  var locationId   = b.locationId   ||(b.customData&&b.customData.locationId);
+  var contactId    = b.contactId    ||(b.customData&&b.customData.contactId);
+  var contactName  = b.contactName  ||(b.customData&&b.customData.contactName)  ||'there';
+  var startTime    = b.startTime    ||(b.customData&&b.customData.startTime);
+  var title        = b.title        ||(b.customData&&b.customData.title)        ||'appointment';
+  var followupNum  = parseInt(b.followupNum||(b.customData&&b.customData.followupNum)||1);
+  if(!locationId||!contactId) return res.json({ok:false,error:'missing_fields'});
+  var config = await getMerchantConfig(locationId);
+  if(!config||!config.crm_access_token) return res.json({ok:false,error:'no_config'});
+  var token = config.crm_access_token;
+  // Look up existing pending short links for this contact
+  var links = (await pool.query(
+    'SELECT code, payment_type, created_at FROM short_links WHERE contact_id=$1 AND location_id=$2 ORDER BY created_at DESC LIMIT 10',
+    [contactId, locationId]
+  )).rows;
+  var depositLink = '', fullLink = '', fresh = false;
+  var cutoff = new Date(Date.now() - 23*60*60*1000); // 23 hours ago
+  var depRow  = links.find(function(r){ return r.payment_type==='deposit' && new Date(r.created_at) > cutoff; });
+  var fullRow = links.find(function(r){ return r.payment_type==='full'    && new Date(r.created_at) > cutoff; });
+  if(depRow && fullRow) {
+    depositLink = APP_URL + '/p/' + depRow.code;
+    fullLink    = APP_URL + '/p/' + fullRow.code;
+  } else {
+    // Links expired - generate new sessions
+    fresh = true;
+    try {
+      var pct = config.deposit_percentage || 30;
+      var total = parseFloat(b.appointmentTotal||(b.customData&&b.customData.appointmentTotal)||0);
+      var depAmt = total > 0 ? Math.round(total*pct/100) : (config.deposit_amount||0);
+      var fullAmt = total;
+      var meta = { locationId:locationId, contactId:contactId, title:title, startTime:startTime, paymentType:'deposit' };
+      var ds = await createHandyPaySession(config.handypay_api_key, depAmt, pct+'% Deposit - '+title, Object.assign({},meta,{paymentType:'deposit'}));
+      var fs = total > 0 ? await createHandyPaySession(config.handypay_api_key, fullAmt, 'Full Payment - '+title, Object.assign({},meta,{paymentType:'full'})) : null;
+      depositLink = await createShortLink(ds.url, ds.id, locationId, contactId, 'deposit');
+      fullLink    = fs ? await createShortLink(fs.url, fs.id, locationId, contactId, 'full') : '';
+    } catch(e) { console.error('[followup] session error:', e.message); return res.json({ok:false,error:'session_failed'}); }
+  }
+  var firstName = contactName.split(' ')[0];
+  var dateStr = (function(iso){ if(!iso) return 'your appointment'; try{ return new Date(iso).toLocaleString('en-US',{weekday:'long',month:'long',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true}); }catch(e){return iso;} })(startTime);
+  var msg;
+  if(followupNum === 1) {
+    msg = firstName+', your '+title+' on '+dateStr+' is not confirmed yet.\n\nYour spot is still open. Pay now:\n\n'+
+      '\uD83D\uDCB3 Deposit:\n'+depositLink+(fullLink ? '\n\n\u2705 Full payment:\n'+fullLink : '');
+  } else {
+    msg = firstName+', last chance. '+title+' on '+dateStr+' - payment still pending.\n\nYour slot gets released if not paid today.\n\n'+
+      '\uD83D\uDCB3 '+depositLink+(fullLink ? '\n\u2705 '+fullLink : '');
+  }
+  try { await sendSms(token, locationId, contactId, msg); } catch(e){ console.error('[followup SMS]',e.message); }
+  res.json({ ok:true, followupNum:followupNum, fresh:fresh, depositLink:depositLink, fullLink:fullLink });
 });
 app.post('/api/webhooks/handypay', async (req, res) => {
   var raw = Buffer.isBuffer(req.body) ? req.body.toString() : JSON.stringify(req.body);
@@ -516,6 +603,20 @@ app.get('/api/init-db', async (req, res) => {
       ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS contact_id VARCHAR(255);
       ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS location_id VARCHAR(255);
       ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'pending';
+    CREATE TABLE IF NOT EXISTS short_links (
+      id           SERIAL PRIMARY KEY,
+      code         TEXT UNIQUE NOT NULL,
+      full_url     TEXT NOT NULL,
+      session_id   TEXT,
+      location_id  TEXT,
+      contact_id   TEXT,
+      payment_type TEXT DEFAULT 'deposit',
+      clicks       INTEGER DEFAULT 0,
+      created_at   TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_sl_code    ON short_links(code);
+    CREATE INDEX IF NOT EXISTS idx_sl_contact ON short_links(contact_id, location_id);
+    CREATE INDEX IF NOT EXISTS idx_sl_session ON short_links(session_id);
     `);
     res.json({ ok: true, message: 'DB initialized/migrated.' });
   } catch (err) { res.status(500).json({ error: err.message }); }
