@@ -744,5 +744,47 @@ app.get('/api/query', async (req, res) => {
   }
 });
 
+// ============================================================
+// GHL NATIVE PAYMENT - GET REDIRECT (browser redirect from GHL)
+// GHL redirects customer browser here via GET with payment params
+// We create HandyPay session then redirect customer to checkout
+// ============================================================
+app.get('/api/pay', async (req, res) => {
+  try {
+    var q = req.query;
+    console.log('[/api/pay GET] params:', JSON.stringify(q));
+    var locationId = q.locationId || q.location_id || q.altId || '';
+    var amountCents = parseInt(q.amount) || 0;
+    var currency = (q.currency || 'JMD').toUpperCase();
+    var description = q.description || q.entityType || 'Invoice Payment';
+    var contactId = q.contactId || q.contact_id || '';
+    var entityId = q.entityId || q.invoiceId || '';
+    if (!locationId) {
+      return res.status(400).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay Error</h2><p>Missing locationId. Params received: ' + JSON.stringify(q) + '</p></body></html>');
+    }
+    var cfg = await getMerchantConfig(locationId);
+    if (!cfg || !cfg.handypay_api_key) {
+      return res.status(400).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay not configured</h2><p>Please complete setup in HandyPay Settings for locationId: ' + locationId + '</p></body></html>');
+    }
+    var amountJMD = amountCents > 0 ? amountCents / 100 : 1;
+    var meta = { locationId: locationId, contactId: contactId, entityId: entityId, source: 'ghl_native', description: description };
+    var session = await createHandyPaySession(cfg.handypay_api_key, amountJMD, description, meta, true);
+    var sessionId = session.id || session.sessionId || session.paymentSessionId;
+    var checkoutUrl = session.url || session.checkoutUrl || session.payment_url || session.paymentUrl;
+    if (!checkoutUrl) {
+      return res.status(500).send('<h2>HandyPay: No checkout URL returned</h2><pre>' + JSON.stringify(session) + '</pre>');
+    }
+    await pool.query(
+      'INSERT INTO payment_logs (session_id,contact_id,location_id,amount,currency,status,payment_type) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (session_id) DO NOTHING',
+      [sessionId, contactId, locationId, amountJMD, currency, 'pending', 'ghl_native']
+    ).catch(function(e) { console.error('[pay-log]', e.message); });
+    console.log('[/api/pay GET] redirect to HandyPay sessionId=%s url=%s', sessionId, checkoutUrl.substring(0, 80));
+    return res.redirect(302, checkoutUrl);
+  } catch (e) {
+    console.error('[/api/pay GET] ERROR', e.message);
+    return res.status(500).send('<h2>HandyPay Error: ' + e.message + '</h2>');
+  }
+});
+
 
 module.exports = app;
