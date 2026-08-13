@@ -788,40 +788,60 @@ app.get('/api/query', async (req, res) => {
 app.get('/api/pay', async (req, res) => {
   try {
     var q = req.query;
-    console.log('[/api/pay GET] params:', JSON.stringify(q));
+    console.log('[/api/pay GET] ALL params:', JSON.stringify(q));
     var locationId = q.locationId || q.location_id || q.altId || '';
-    var amountCents = parseInt(q.amount) || 0;
-    var currency = (q.currency || 'JMD').toUpperCase();
-    var description = q.description || q.entityType || 'Invoice Payment';
-    var contactId = q.contactId || q.contact_id || '';
-    var entityId = q.entityId || q.invoiceId || '';
     if (!locationId) {
-      return res.status(400).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay Error</h2><p>Missing locationId. Params received: ' + JSON.stringify(q) + '</p></body></html>');
+      return res.status(400).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay Error</h2><p>Missing locationId.</p><pre>' + JSON.stringify(q, null, 2) + '</pre></body></html>');
     }
     var cfg = await getMerchantConfig(locationId);
     if (!cfg || !cfg.handypay_api_key) {
-      return res.status(400).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay not configured</h2><p>Please complete setup in HandyPay Settings for locationId: ' + locationId + '</p></body></html>');
+      return res.status(400).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay not configured</h2><p>locationId: ' + locationId + '</p></body></html>');
     }
-    
+    // MODE A: POST already stored a session — redirect to it
     var row = (await pool.query(
       "SELECT checkout_url, session_id FROM payment_logs WHERE location_id=$1 AND payment_type='ghl_native' AND status='pending' ORDER BY created_at DESC LIMIT 1",
       [locationId]
     )).rows[0];
-    if (!row || !row.checkout_url) {
-      return res.status(404).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay</h2><p>Payment session not ready. Retry from your invoice.</p></body></html>');
+    if (row && row.checkout_url) {
+      console.log('[/api/pay GET] Mode A: redirect to stored session', row.session_id);
+      return res.redirect(302, row.checkout_url);
     }
-    console.log('[/api/pay GET] redirect to stored session', row.session_id);
-    return res.redirect(302, row.checkout_url);
-    } catch (e) {
+    // MODE B: GHL only called GET (no POST) — create session from query params
+    console.log('[/api/pay GET] Mode B: no stored session, using query params');
+    // GHL may send amount in cents (amountCents) or as raw value (amount)
+    var rawAmount = parseInt(q.amountCents || q.amount || q.total || '0') || 0;
+    // If value looks like cents (e.g. 50000 for J$500), divide by 100; else treat as JMD
+    var amountJMD = rawAmount >= 10000 ? rawAmount / 100 : rawAmount;
+    var contactId = q.contactId || q.contact_id || '';
+    var entityId = q.entityId || q.invoiceId || '';
+    var description = q.description || q.entityType || 'Invoice Payment';
+    console.log('[/api/pay GET] Mode B rawAmount:', rawAmount, 'amountJMD:', amountJMD);
+    if (amountJMD < 80) {
+      return res.status(400).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay</h2><p>Amount missing or too low (need J$80+). Got amountJMD=' + amountJMD + '</p><p>Full params:</p><pre>' + JSON.stringify(q, null, 2) + '</pre></body></html>');
+    }
+    var session = await createHandyPaySession(
+      cfg.handypay_api_key,
+      amountJMD,
+      description,
+      { contact_id: contactId, location_id: locationId, entity_id: entityId, payment_type: 'ghl_native' },
+      true
+    );
+    var sessionId = session.id || session.sessionId || session.session_id;
+    var checkoutUrl = session.url || session.checkout_url || session.checkoutUrl;
+    await pool.query(
+      `INSERT INTO payment_logs (session_id, location_id, contact_id, amount, currency, status, payment_type, checkout_url)
+       VALUES ($1, $2, $3, $4, 'JMD', 'pending', 'ghl_native', $5)
+       ON CONFLICT (session_id) DO UPDATE SET checkout_url=$5, updated_at=NOW()`,
+      [sessionId, locationId, contactId, Math.round(amountJMD), checkoutUrl]
+    );
+    console.log('[/api/pay GET] Mode B: session created', sessionId, checkoutUrl);
+    return res.redirect(302, checkoutUrl);
+  } catch (e) {
     console.error('[/api/pay GET] ERROR', e.message);
     return res.status(500).send('<h2>HandyPay Error: ' + e.message + '</h2>');
   }
 });
 
-// ============================================================
-// RE-REGISTER PAYMENT PROVIDER (admin tool)
-// POST /api/re-register?secret=xxx&locationId=xxx
-// ============================================================
 app.post('/api/re-register', async (req, res) => {
   if (req.query.secret !== process.env.INIT_SECRET) return res.status(403).json({ error: 'forbidden' });
   var locationId = req.query.locationId;
