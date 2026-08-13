@@ -786,5 +786,24 @@ app.get('/api/pay', async (req, res) => {
   }
 });
 
+// ============================================================
+// RE-REGISTER PAYMENT PROVIDER (admin tool)
+// POST /api/re-register?secret=xxx&locationId=xxx
+// ============================================================
+app.post('/api/re-register', async (req, res) => {
+  if (req.query.secret !== process.env.INIT_SECRET) return res.status(403).json({ error: 'forbidden' });
+  var locationId = req.query.locationId;
+  if (!locationId) return res.status(400).json({ error: 'Missing locationId' });
+  var cfg = await getMerchantConfig(locationId);
+  if (!cfg) return res.status(404).json({ error: 'Location not found in DB' });
+  var token = cfg.crm_access_token;
+  if (!token) {
+    try { token = await refreshCrmToken(locationId); } catch(e) { return res.status(400).json({ error: 'No CRM token: ' + e.message }); }
+  }
+  var result = await registerPaymentProvider(locationId, token);
+  var result2 = await activatePaymentModes(locationId, token, cfg.handypay_api_key || 'hp_pending_setup', cfg.mode || 'test');
+  return res.json({ ok: true, register: result, activate: result2 });
+});
+
 
 module.exports = app;
