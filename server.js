@@ -205,7 +205,7 @@ async function registerPaymentProvider(locationId, accessToken) {
       body: JSON.stringify({
         name: 'HandyPay Deposits',
         description: 'Collect booking deposits automatically via SMS payment link.',
-        paymentsUrl: APP_URL + '/api/pay',
+        paymentsUrl: APP_URL + '/api/pay?locationId=' + locationId,
         queryUrl: APP_URL + '/api/query',
         imageUrl: LOGO_URL,
         supportsSubscriptionSchedule: false
@@ -695,7 +695,7 @@ app.get('/api/init-db', async (req, res) => {
 app.post('/api/pay', async (req, res) => {
   try {
     var body = req.body;
-    var locationId = (body.meta && body.meta.locationId) || body.locationId || '';
+    var locationId = (body.meta && body.meta.locationId) || body.locationId || body.altId || '';
     var amountCents = parseInt(body.amount) || 0;
     var currency = (body.currency || 'JMD').toUpperCase();
     var description = body.description || 'Payment';
