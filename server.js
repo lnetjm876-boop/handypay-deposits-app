@@ -600,28 +600,61 @@ app.get('/api/payment-cancel', (req, res) => {
 // PAY + QUERY (for CRM payment provider engine)
 // ============================================================
 app.post('/api/pay', async (req, res) => {
-  var body = Buffer.isBuffer(req.body) ? JSON.parse(req.body.toString()) : req.body;
-  var amount = body.amount, currency = body.currency, contactId = body.contactId, locationId = body.locationId;
   try {
-    var config = await getMerchantConfig(locationId);
-    if (!config || !config.handypay_api_key) return res.status(400).json({ error: 'HandyPay not configured' });
-    var session = await createHandyPaySession(config.handypay_api_key, {
-      amount: Math.round(amount), currency: currency || 'JMD', contact: {},
-      metadata: { contact_id: contactId, location_id: locationId },
-      successUrl: APP_URL + '/api/payment-success?session_id={CHECKOUT_SESSION_ID}',
-      cancelUrl: APP_URL + '/api/payment-cancel'
-    });
-    res.json({ paymentUrl: session.url || session.payment_url, sessionId: session.id });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    var body = Buffer.isBuffer(req.body) ? JSON.parse(req.body.toString()) : req.body;
+    console.log('[/api/pay POST] body:', JSON.stringify(body).substring(0, 400));
+    // GHL sends altId (not locationId) and amountCents (in cents, not dollars)
+    var locationId = body.altId || body.locationId || '';
+    var amountCents = parseInt(body.amountCents) || 0;
+    var amountJMD = amountCents / 100;
+    var contactId = body.contactId || body.contact_id || '';
+    var entityId = body.entityId || body.invoiceId || '';
+    var description = body.description || body.entityType || 'Invoice Payment';
+    console.log('[/api/pay POST] locationId:', locationId, 'amountCents:', amountCents, 'amountJMD:', amountJMD);
+    if (!locationId) return res.status(400).json({ error: 'Missing locationId/altId' });
+    if (amountJMD < 80) return res.status(400).json({ error: 'Amount too low, minimum J$80' });
+    var cfg = await getMerchantConfig(locationId);
+    if (!cfg || !cfg.handypay_api_key) {
+      return res.status(400).json({ error: 'HandyPay not configured for location: ' + locationId });
+    }
+    var session = await createHandyPaySession(
+      cfg.handypay_api_key,
+      amountJMD,
+      description,
+      { contact_id: contactId, location_id: locationId, entity_id: entityId, payment_type: 'ghl_native' },
+      true
+    );
+    var sessionId = session.id || session.sessionId || session.session_id;
+    var checkoutUrl = session.url || session.checkout_url || session.checkoutUrl;
+    // Store in DB so GET /api/pay can look up checkout_url
+    await pool.query(
+      `INSERT INTO payment_logs (session_id, location_id, contact_id, amount, currency, status, payment_type, checkout_url)
+       VALUES ($1, $2, $3, $4, 'JMD', 'pending', 'ghl_native', $5)
+       ON CONFLICT (session_id) DO UPDATE SET checkout_url=$5, updated_at=NOW()`,
+      [sessionId, locationId, contactId, Math.round(amountJMD), checkoutUrl]
+    );
+    console.log('[/api/pay POST] stored session:', sessionId, checkoutUrl);
+    return res.json({ paymentIntentId: sessionId, checkoutUrl: checkoutUrl });
+  } catch (err) {
+    console.error('[/api/pay POST] ERROR:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
 });
 
-app.post('/api/query', async (req, res) => {
-  var body = Buffer.isBuffer(req.body) ? JSON.parse(req.body.toString()) : req.body;
-  var sessionId = body.sessionId;
+app.get('/api/query', async (req, res) => {
   try {
-    var log = await getPaymentLogBySession(sessionId);
-    res.json({ status: (log && log.status) || 'pending', sessionId: sessionId });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    var paymentIntentId = req.query.paymentIntentId || req.query.sessionId || '';
+    console.log('[/api/query GET] paymentIntentId:', paymentIntentId);
+    if (!paymentIntentId) return res.json({ status: 'pending' });
+    var log = await getPaymentLogBySession(paymentIntentId);
+    var status = (log && log.status) || 'pending';
+    var ghlStatus = status === 'completed' ? 'succeeded' : status === 'failed' ? 'failed' : status === 'expired' ? 'cancelled' : 'pending';
+    console.log('[/api/query GET] status:', ghlStatus);
+    return res.json({ status: ghlStatus, paymentIntentId: paymentIntentId });
+  } catch (err) {
+    console.error('[/api/query GET] ERROR:', err.message);
+    return res.json({ status: 'pending' });
+  }
 });
 
 // ============================================================
