@@ -688,4 +688,61 @@ app.get('/api/init-db', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ============================================================
+// GHL NATIVE PAYMENT - INITIATION
+// GHL calls this when customer pays invoice/order via HandyPay
+// ============================================================
+app.post('/api/pay', async (req, res) => {
+  try {
+    var body = req.body;
+    var locationId = (body.meta && body.meta.locationId) || body.locationId || '';
+    var amountCents = parseInt(body.amount) || 0;
+    var currency = (body.currency || 'JMD').toUpperCase();
+    var description = body.description || 'Payment';
+    var contact = body.contact || {};
+    var contactId = contact.id || '';
+    if (!locationId) return res.status(400).json({ error: 'Missing locationId in request' });
+    var cfg = await getMerchantConfig(locationId);
+    if (!cfg || !cfg.handypay_api_key) {
+      return res.status(400).json({ error: 'HandyPay not configured. Complete setup in Settings.' });
+    }
+    var amountJMD = amountCents / 100;
+    var meta = { locationId: locationId, contactId: contactId, source: 'ghl_native', description: description };
+    var session = await createHandyPaySession(cfg.handypay_api_key, amountJMD, description, meta, true);
+    var sessionId = session.id || session.sessionId || session.paymentSessionId;
+    var checkoutUrl = session.url || session.checkoutUrl || session.payment_url || session.paymentUrl;
+    if (!sessionId || !checkoutUrl) {
+      return res.status(500).json({ error: 'HandyPay did not return a valid session', raw: session });
+    }
+    await pool.query(
+      'INSERT INTO payment_logs (session_id,contact_id,location_id,amount,currency,status,payment_type) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (session_id) DO NOTHING',
+      [sessionId, contactId, locationId, amountJMD, currency, 'pending', 'ghl_native']
+    ).catch(function(e) { console.error('[pay-log]', e.message); });
+    console.log('[/api/pay] locationId=%s amount=%s sessionId=%s', locationId, amountJMD, sessionId);
+    return res.json({ paymentIntentId: sessionId, checkoutUrl: checkoutUrl });
+  } catch (e) {
+    console.error('[/api/pay] ERROR', e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+// ============================================================
+// GHL NATIVE PAYMENT - STATUS QUERY
+// GHL polls this to check if HandyPay payment succeeded
+// ============================================================
+app.get('/api/query', async (req, res) => {
+  try {
+    var paymentIntentId = req.query.paymentIntentId || req.query.sessionId || req.query.id;
+    if (!paymentIntentId) return res.status(400).json({ error: 'Missing paymentIntentId' });
+    var log = await getPaymentLogBySession(paymentIntentId);
+    if (!log) return res.status(404).json({ error: 'Payment not found', paymentIntentId: paymentIntentId });
+    var statusMap = { paid: 'succeeded', pending: 'pending', superseded: 'cancelled', expired: 'cancelled', failed: 'failed' };
+    var ghlStatus = statusMap[log.status] || 'pending';
+    return res.json({ paymentIntentId: paymentIntentId, status: ghlStatus, amount: Math.round((parseFloat(log.amount) || 0) * 100), currency: log.currency || 'JMD' });
+  } catch (e) {
+    console.error('[/api/query] ERROR', e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+
 module.exports = app;
