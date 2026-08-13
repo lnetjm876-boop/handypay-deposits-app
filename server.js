@@ -683,6 +683,7 @@ app.get('/api/init-db', async (req, res) => {
     CREATE INDEX IF NOT EXISTS idx_sl_session ON short_links(session_id);
     ALTER TABLE merchant_configs ADD COLUMN IF NOT EXISTS handypay_webhook_id VARCHAR(100);
     ALTER TABLE merchant_configs ADD COLUMN IF NOT EXISTS handypay_webhook_secret VARCHAR(100);
+        ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS checkout_url TEXT;
     `);
     res.json({ ok: true, message: 'DB initialized/migrated.' });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -715,8 +716,8 @@ app.post('/api/pay', async (req, res) => {
       return res.status(500).json({ error: 'HandyPay did not return a valid session', raw: session });
     }
     await pool.query(
-      'INSERT INTO payment_logs (session_id,contact_id,location_id,amount,currency,status,payment_type) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (session_id) DO NOTHING',
-      [sessionId, contactId, locationId, amountJMD, currency, 'pending', 'ghl_native']
+      'INSERT INTO payment_logs (session_id,contact_id,location_id,amount,currency,status,payment_type,checkout_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (session_id) DO NOTHING',
+      [sessionId, contactId, locationId, amountJMD, currency, 'pending', 'ghl_native', checkoutUrl]
     ).catch(function(e) { console.error('[pay-log]', e.message); });
     console.log('[/api/pay] locationId=%s amount=%s sessionId=%s', locationId, amountJMD, sessionId);
     return res.json({ paymentIntentId: sessionId, checkoutUrl: checkoutUrl });
@@ -792,5 +793,30 @@ app.post('/api/re-register', async (req, res) => {
   return res.json({ ok: true, register: result, activate: result2 });
 });
 
+
+
+// ============================================================
+// GHL IFRAME HANDLER - retrieve stored checkout URL from DB
+// ============================================================
+app.get('/api/pay', async (req, res) => {
+  var locationId = req.query.locationId || req.query.location_id || '';
+  if (!locationId) {
+    return res.status(400).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay Error</h2><p>Missing locationId. Please reload the invoice page.</p></body></html>');
+  }
+  try {
+    var row = (await pool.query(
+      "SELECT checkout_url, session_id FROM payment_logs WHERE location_id=$1 AND payment_type=\'ghl_native\' AND status=\'pending\' ORDER BY created_at DESC LIMIT 1",
+      [locationId]
+    )).rows[0];
+    if (!row || !row.checkout_url) {
+      return res.status(404).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay</h2><p>Payment session not ready. Please close this window and try again from your invoice.</p></body></html>');
+    }
+    console.log('[/api/pay GET] redirecting to stored session', row.session_id);
+    return res.redirect(302, row.checkout_url);
+  } catch (e) {
+    console.error('[/api/pay GET] ERROR', e.message);
+    return res.status(500).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay Error</h2><p>' + e.message + '</p></body></html>');
+  }
+});
 
 module.exports = app;
