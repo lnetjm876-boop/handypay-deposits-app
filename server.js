@@ -25,8 +25,10 @@ app.get('/', (req, res) => res.json({ status: 'ok', service: 'HandyPay Deposits 
 // SUCCESS / CANCEL PAGES
 // ============================================================
 app.get('/success', (req, res) => {
+  var sessionId = req.query.session_id || req.query.sessionId || '';
   res.setHeader('Content-Type', 'text/html');
-  res.send('<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Payment Confirmed</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f0fdf4;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}.card{background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(0,0,0,.08);max-width:420px;width:100%;padding:40px;text-align:center}.icon{font-size:64px;margin-bottom:16px}h1{font-size:22px;font-weight:800;color:#15803d;margin-bottom:10px}p{font-size:15px;color:#555;line-height:1.6}.sub{font-size:13px;color:#888;margin-top:20px}</style></head><body><div class="card"><div class="icon">\u2705</div><h1>Payment Confirmed!</h1><p>Thank you for your payment. Your appointment is confirmed and a reminder will be sent before your visit.</p><p class="sub">You can close this window.</p></div></body></html>');
+  var sid = JSON.stringify(sessionId);
+  res.send('<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Payment Confirmed</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f0fdf4;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}.card{background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(0,0,0,.08);max-width:420px;width:100%;padding:40px;text-align:center}.icon{font-size:64px;margin-bottom:16px}h1{font-size:22px;font-weight:800;color:#15803d;margin-bottom:10px}p{font-size:15px;color:#555;line-height:1.6}.sub{font-size:13px;color:#888;margin-top:20px}</style></head><body><div class="card"><div class="icon">&#x2705;</div><h1>Payment Confirmed!</h1><p>Thank you. Your payment was received successfully.</p><p class="sub">You may close this window.</p></div><script>var s='+sid+';if(s){try{window.parent.postMessage({type:"PAYMENT_SUCCESS",paymentIntentId:s,status:"succeeded"},"*");window.parent.postMessage({event:"payment-success",paymentIntentId:s},"*");window.parent.postMessage({success:true,paymentIntentId:s,orderId:s},"*");}catch(e){}}setTimeout(function(){try{window.parent.postMessage({type:"PAYMENT_COMPLETE",paymentIntentId:s},"*");}catch(e){}},2000);<\/script></body></html>');
 });
 
 app.get('/cancel', (req, res) => {
@@ -719,6 +721,10 @@ app.get('/api/init-db', async (req, res) => {
         ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS checkout_url TEXT;
     ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS payment_type TEXT DEFAULT 'deposit';
     ALTER TABLE merchant_configs ADD COLUMN IF NOT EXISTS deposit_percentage INTEGER DEFAULT 30;
+    CREATE TABLE IF NOT EXISTS debug_messages (
+      id SERIAL PRIMARY KEY, location_id TEXT, message TEXT, origin TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
     `);
     res.json({ ok: true, message: 'DB initialized/migrated.' });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -781,66 +787,154 @@ app.get('/api/query', async (req, res) => {
 });
 
 // ============================================================
-// GHL NATIVE PAYMENT - GET REDIRECT (browser redirect from GHL)
-// GHL redirects customer browser here via GET with payment params
-// We create HandyPay session then redirect customer to checkout
+// ============================================================
+// GHL PAYMENT IFRAME PAGE (postMessage architecture)
+// GHL opens this URL in an iframe. We serve an HTML page that:
+// 1. Listens for GHL's postMessage with payment amount
+// 2. Creates HandyPay session via /api/create-native-session
+// 3. Redirects iframe to HandyPay checkout
+// 4. On success, /success page sends paymentIntentId back to GHL via postMessage
 // ============================================================
 app.get('/api/pay', async (req, res) => {
   try {
     var q = req.query;
-    console.log('[/api/pay GET] ALL params:', JSON.stringify(q));
+    console.log('[/api/pay GET] params:', JSON.stringify(q));
     var locationId = q.locationId || q.location_id || q.altId || '';
     if (!locationId) {
       return res.status(400).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay Error</h2><p>Missing locationId.</p><pre>' + JSON.stringify(q, null, 2) + '</pre></body></html>');
     }
     var cfg = await getMerchantConfig(locationId);
     if (!cfg || !cfg.handypay_api_key) {
-      return res.status(400).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay not configured</h2><p>locationId: ' + locationId + '</p></body></html>');
+      return res.status(400).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay not configured</h2><p>Complete setup in HandyPay Settings.</p></body></html>');
     }
-    // MODE A: POST already stored a session — redirect to it
-    var row = (await pool.query(
-      "SELECT checkout_url, session_id FROM payment_logs WHERE location_id=$1 AND payment_type='ghl_native' AND status='pending' ORDER BY created_at DESC LIMIT 1",
-      [locationId]
-    )).rows[0];
-    if (row && row.checkout_url) {
-      console.log('[/api/pay GET] Mode A: redirect to stored session', row.session_id);
-      return res.redirect(302, row.checkout_url);
-    }
-    // MODE B: GHL only called GET (no POST) — create session from query params
-    console.log('[/api/pay GET] Mode B: no stored session, using query params');
-    // GHL may send amount in cents (amountCents) or as raw value (amount)
-    var rawAmount = parseInt(q.amountCents || q.amount || q.total || '0') || 0;
-    // If value looks like cents (e.g. 50000 for J$500), divide by 100; else treat as JMD
-    var amountJMD = rawAmount >= 10000 ? rawAmount / 100 : rawAmount;
-    var contactId = q.contactId || q.contact_id || '';
-    var entityId = q.entityId || q.invoiceId || '';
-    var description = q.description || q.entityType || 'Invoice Payment';
-    console.log('[/api/pay GET] Mode B rawAmount:', rawAmount, 'amountJMD:', amountJMD);
-    if (amountJMD < 80) {
-      return res.status(400).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay</h2><p>Amount missing or too low (need J$80+). Got amountJMD=' + amountJMD + '</p><p>Full params:</p><pre>' + JSON.stringify(q, null, 2) + '</pre></body></html>');
-    }
-    var session = await createHandyPaySession(
-      cfg.handypay_api_key,
-      amountJMD,
-      description,
-      { contact_id: contactId, location_id: locationId, entity_id: entityId, payment_type: 'ghl_native' },
-      true
-    );
-    var sessionId = session.id || session.sessionId || session.session_id;
-    var checkoutUrl = session.url || session.checkout_url || session.checkoutUrl;
-    await pool.query(
-      `INSERT INTO payment_logs (session_id, location_id, contact_id, amount, currency, status, payment_type, checkout_url)
-       VALUES ($1, $2, $3, $4, 'JMD', 'pending', 'ghl_native', $5)
-       ON CONFLICT (session_id) DO UPDATE SET checkout_url=$5, updated_at=NOW()`,
-      [sessionId, locationId, contactId, Math.round(amountJMD), checkoutUrl]
-    );
-    console.log('[/api/pay GET] Mode B: session created', sessionId, checkoutUrl);
-    return res.redirect(302, checkoutUrl);
-  } catch (e) {
-    console.error('[/api/pay GET] ERROR', e.message);
-    return res.status(500).send('<h2>HandyPay Error: ' + e.message + '</h2>');
+    var locId = locationId;
+    var html = `<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HandyPay</title>
+<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f4f6fb;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px}.card{background:#fff;border-radius:14px;box-shadow:0 4px 24px rgba(0,0,0,.09);padding:32px;text-align:center;max-width:380px;width:100%}.logo{font-size:40px;margin-bottom:14px}h2{color:#D10039;font-size:18px;font-weight:800;margin-bottom:6px}p{color:#555;font-size:14px;margin-bottom:10px}.spinner{width:36px;height:36px;border:3px solid #f0f0f0;border-top-color:#D10039;border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 14px}@keyframes spin{to{transform:rotate(360deg)}}.err{color:#b91c1c;font-weight:600}pre{font-size:10px;color:#888;text-align:left;white-space:pre-wrap;word-break:break-all;margin-top:10px;background:#f8f8f8;padding:8px;border-radius:6px;max-height:150px;overflow:auto;display:none}</style>
+</head>
+<body><div class="card"><div class="logo">&#x1F4B3;</div><h2>HandyPay</h2><div class="spinner" id="spin"></div><p id="msg">Loading payment details...</p><pre id="dbg"></pre></div>
+<script>
+var LOC="${ locId }",msgs=[],done=false;
+function log(s){var e=document.getElementById('dbg');e.style.display='block';e.textContent+=s+'\n';}
+function setMsg(s,isErr){document.getElementById('msg').textContent=s;if(isErr){document.getElementById('msg').className='err';document.getElementById('spin').style.display='none';}}
+function jmdFrom(raw,cur){var n=parseFloat(raw)||0;if(!n)return 0;cur=(cur||'').toUpperCase();if(cur==='USD')return Math.round((n>=100?n/100:n)*155);return Math.round(n>=10000?n/100:n);}
+function doPayment(jmd,desc,cid,eid){
+  if(done)return;done=true;
+  setMsg('Creating payment for J
+app.post('/api/re-register', async (req, res) => {
+  if (req.query.secret !== process.env.INIT_SECRET) return res.status(403).json({ error: 'forbidden' });
+  var locationId = req.query.locationId;
+  if (!locationId) return res.status(400).json({ error: 'Missing locationId' });
+  var cfg = await getMerchantConfig(locationId);
+  if (!cfg) return res.status(404).json({ error: 'Location not found in DB' });
+  var token = cfg.crm_access_token;
+  if (!token) {
+    try { token = await refreshCrmToken(locationId); } catch(e) { return res.status(400).json({ error: 'No CRM token: ' + e.message }); }
+  }
+  var result = await registerPaymentProvider(locationId, token);
+  var result2 = await activatePaymentModes(locationId, token, cfg.handypay_api_key || 'hp_pending_setup', cfg.mode || 'test');
+  return res.json({ ok: true, register: result, activate: result2 });
+});
+
+
+
+module.exports = app;
++jmd.toLocaleString()+'...');
+  fetch('/api/create-native-session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({locationId:LOC,amountJMD:jmd,description:desc,contactId:cid,entityId:eid})})
+  .then(function(r){return r.json();})
+  .then(function(d){if(d.checkoutUrl){setMsg('Redirecting to HandyPay...');window.location.href=d.checkoutUrl;}else{setMsg('Error: '+(d.error||'no checkout URL'),true);log('Backend err: '+JSON.stringify(d));}})
+  .catch(function(e){setMsg('Network error: '+e.message,true);});
+}
+window.addEventListener('message',function(e){
+  var data=e.data||{};msgs.push(data);
+  var ms=JSON.stringify(data);log('MSG['+e.origin+']: '+ms.substring(0,300));
+  fetch('/api/debug-message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({locationId:LOC,message:data,origin:e.origin})}).catch(function(){});
+  var raw=data.amount||data.amountCents||data.total||(data.payment&&data.payment.amount)||(data.data&&data.data.amount)||0;
+  var cur=data.currency||data.currencyCode||'';
+  var desc=data.description||data.entityType||'Invoice Payment';
+  var cid=data.contactId||'';
+  var eid=data.entityId||data.invoiceId||'';
+  if(raw>0){var jmd=jmdFrom(raw,cur);log('Amount '+raw+' '+cur+' => J
+app.post('/api/re-register', async (req, res) => {
+  if (req.query.secret !== process.env.INIT_SECRET) return res.status(403).json({ error: 'forbidden' });
+  var locationId = req.query.locationId;
+  if (!locationId) return res.status(400).json({ error: 'Missing locationId' });
+  var cfg = await getMerchantConfig(locationId);
+  if (!cfg) return res.status(404).json({ error: 'Location not found in DB' });
+  var token = cfg.crm_access_token;
+  if (!token) {
+    try { token = await refreshCrmToken(locationId); } catch(e) { return res.status(400).json({ error: 'No CRM token: ' + e.message }); }
+  }
+  var result = await registerPaymentProvider(locationId, token);
+  var result2 = await activatePaymentModes(locationId, token, cfg.handypay_api_key || 'hp_pending_setup', cfg.mode || 'test');
+  return res.json({ ok: true, register: result, activate: result2 });
+});
+
+
+
+module.exports = app;
++jmd);doPayment(jmd,desc,cid,eid);}
+});
+try{window.parent.postMessage({type:'PAYMENT_PROVIDER_READY',provider:'handypay'},'*');window.parent.postMessage({event:'ready',source:'custom-provider'},'*');}catch(x){log('send err:'+x.message);}
+setTimeout(function(){if(done)return;document.getElementById('spin').style.display='none';setMsg('Waiting for payment data from GHL...');log('10s timeout | msgs:'+msgs.length+' | '+JSON.stringify(msgs));},10000);
+</script></body></html>`;
+    res.setHeader('Content-Type','text/html');
+    return res.send(html);
+  } catch(e) {
+    console.error('[/api/pay GET] ERR',e.message);
+    return res.status(500).send('<h2>HandyPay Error: '+e.message+'</h2>');
   }
 });
+
+// ============================================================
+// NATIVE SESSION CREATION (called by iframe JS)
+// ============================================================
+app.post('/api/create-native-session', async (req, res) => {
+  try {
+    var locationId=req.body.locationId, amountJMD=parseFloat(req.body.amountJMD)||0;
+    var description=req.body.description||'Invoice Payment', contactId=req.body.contactId||'', entityId=req.body.entityId||'';
+    console.log('[create-native-session]',locationId,amountJMD);
+    if(!locationId||amountJMD<80) return res.status(400).json({error:'Need locationId+amountJMD>=80. Got:'+amountJMD});
+    var cfg=await getMerchantConfig(locationId);
+    if(!cfg||!cfg.handypay_api_key) return res.status(400).json({error:'Not configured: '+locationId});
+    var session=await createHandyPaySession(cfg.handypay_api_key,amountJMD,description,
+      {contact_id:contactId,location_id:locationId,entity_id:entityId,payment_type:'ghl_native'},true);
+    var sessionId=session.id||session.sessionId||session.session_id;
+    var checkoutUrl=session.url||session.checkout_url||session.checkoutUrl;
+    await pool.query(
+      `INSERT INTO payment_logs (session_id,location_id,contact_id,amount,currency,status,payment_type,checkout_url)
+       VALUES ($1,$2,$3,$4,'JMD','pending','ghl_native',$5)
+       ON CONFLICT (session_id) DO UPDATE SET checkout_url=$5,updated_at=NOW()`,
+      [sessionId,locationId,contactId,Math.round(amountJMD),checkoutUrl]
+    );
+    console.log('[create-native-session] ok:',sessionId);
+    return res.json({sessionId,checkoutUrl,paymentIntentId:sessionId});
+  } catch(e){
+    console.error('[create-native-session] ERR:',e.message);
+    return res.status(500).json({error:e.message});
+  }
+});
+
+// ============================================================
+// DEBUG MESSAGE CAPTURE (postMessages from GHL iframe)
+// ============================================================
+app.post('/api/debug-message', async (req, res) => {
+  try {
+    await pool.query('INSERT INTO debug_messages (location_id,message,origin) VALUES ($1,$2,$3)',
+      [req.body.locationId||'',JSON.stringify(req.body.message||{}),req.body.origin||'']).catch(function(){});
+    return res.json({ok:true});
+  } catch(e){return res.json({ok:false});}
+});
+
+app.get('/api/debug-messages', async (req, res) => {
+  if(req.query.secret!==process.env.INIT_SECRET) return res.status(403).json({error:'Forbidden'});
+  try {
+    var rows=(await pool.query('SELECT * FROM debug_messages ORDER BY created_at DESC LIMIT 20')).rows;
+    return res.json({count:rows.length,messages:rows});
+  } catch(e){return res.json({error:e.message,note:'Run /api/init-db first'});}
+});
+
 
 app.post('/api/re-register', async (req, res) => {
   if (req.query.secret !== process.env.INIT_SECRET) return res.status(403).json({ error: 'forbidden' });
