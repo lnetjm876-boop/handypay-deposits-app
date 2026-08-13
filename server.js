@@ -174,12 +174,13 @@ async function createShortLink(fullUrl, sessionId, locationId, contactId, paymen
 // ============================================================
 // HANDYPAY HELPERS
 // ============================================================
-async function createHandyPaySession(apiKey, amountJMD, label, meta) {
+async function createHandyPaySession(apiKey, amountJMD, label, meta, passFeesToCustomer) {
   var payload = {
     line_items: [{ amount: Math.round(amountJMD) * 100, currency: 'jmd', name: label, quantity: 1 }],
     mode: 'payment',
-    success_url: APP_URL + '/success',
+    success_url: APP_URL + '/success?session_id={CHECKOUT_SESSION_ID}',
     cancel_url: APP_URL + '/cancel',
+    pass_fees_to_customer: passFeesToCustomer !== false,
     metadata: meta
   };
   var r = await fetch(HP_BASE + '/payment-sessions', {
@@ -232,6 +233,40 @@ async function activatePaymentModes(locationId, accessToken, apiKey, mode) {
     console.log('[activate]', locationId, mode, r.status, JSON.stringify(d).substring(0, 200));
     return d;
   } catch (e) { console.error('[activate]', e.message); }
+}
+
+
+// ============================================================
+// HANDYPAY WEBHOOK REGISTRATION (per sub-account)
+// ============================================================
+async function registerHandyPayWebhook(apiKey, locationId) {
+  try {
+    var cfg = await getMerchantConfig(locationId);
+    if (cfg && cfg.handypay_webhook_id) {
+      await fetch(HP_BASE + '/webhook-endpoints/' + cfg.handypay_webhook_id, {
+        method: 'DELETE',
+        headers: { 'Authorization': 'Bearer ' + apiKey }
+      }).catch(function() {});
+    }
+    var r = await fetch(HP_BASE + '/webhook-endpoints', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: APP_URL + '/api/webhooks/handypay',
+        events: ['checkout.session.completed', 'checkout.session.expired']
+      })
+    });
+    var d = await r.json();
+    if (d.success && d.data) {
+      await pool.query(
+        'UPDATE merchant_configs SET handypay_webhook_id=$1, handypay_webhook_secret=$2, updated_at=NOW() WHERE location_id=$3',
+        [d.data.id, d.data.secret, locationId]
+      );
+      console.log('[webhook-register]', locationId, d.data.id, 'active:', d.data.isActive);
+      return d.data;
+    }
+    console.error('[webhook-register] failed:', JSON.stringify(d));
+  } catch (e) { console.error('[webhook-register]', e.message); }
 }
 
 // ============================================================
@@ -318,6 +353,7 @@ app.post('/api/settings', async (req, res) => {
       await activatePaymentModes(location_id, rows[0].crm_access_token, handypay_api_key, mode || 'test');
       await activatePaymentModes(location_id, rows[0].crm_access_token, handypay_api_key, mode || 'test');
     }
+    await registerHandyPayWebhook(handypay_api_key, location_id);
     res.redirect('/api/settings?location_id=' + location_id + '&saved=true');
   } catch (err) {
     console.error('[settings POST]', err);
@@ -451,18 +487,38 @@ app.post('/api/webhooks/followup', async (req, res) => {
   res.json({ ok:true, followupNum:followupNum, fresh:fresh, depositLink:depositLink, fullLink:fullLink });
 });
 app.post('/api/webhooks/handypay', async (req, res) => {
-  var raw = Buffer.isBuffer(req.body) ? req.body.toString() : JSON.stringify(req.body);
-  var sig = req.headers['handypay-signature'] || req.headers['stripe-signature'] || req.headers['x-handypay-signature'] || '';
+  var rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body));
+  var sig = req.headers['x-handypay-signature'] || '';
+  var event;
+  try { event = JSON.parse(rawBody.toString()); }
+  catch (e) { return res.status(400).json({ error: 'Invalid JSON' }); }
 
-  if (process.env.HANDYPAY_WEBHOOK_SECRET && sig) {
-    var expected = crypto.createHmac('sha256', process.env.HANDYPAY_WEBHOOK_SECRET).update(raw).digest('hex');
-    if (sig.indexOf(expected) === -1) {
-      console.error('[hp webhook] Bad signature');
-      return res.status(401).json({ error: 'Invalid signature' });
+  if (sig) {
+    var locId = (event.data && event.data.metadata && event.data.metadata.locationId) || null;
+    if (locId) {
+      var sigCfg = await getMerchantConfig(locId).catch(function() { return null; });
+      var whSecret = sigCfg && sigCfg.handypay_webhook_secret;
+      if (whSecret && sig.startsWith('sha256=')) {
+        var hexSig = sig.slice(7);
+        var expected = crypto.createHmac('sha256', whSecret).update(rawBody).digest('hex');
+        try {
+          if (!crypto.timingSafeEqual(Buffer.from(hexSig, 'hex'), Buffer.from(expected, 'hex'))) {
+            console.error('[sig-mismatch]', locId);
+            return res.status(401).json({ error: 'Invalid signature' });
+          }
+        } catch (e) { return res.status(401).json({ error: 'Sig error' }); }
+      }
     }
   }
 
-  var body = Buffer.isBuffer(req.body) ? JSON.parse(raw) : req.body;
+  if (event.type === 'checkout.session.expired') {
+    var expId = event.data && event.data.id;
+    if (expId) { await updatePaymentLogStatus(expId, 'expired').catch(function(){}); }
+    console.log('[hp-expired]', expId);
+    return res.json({ ok: true, type: 'expired' });
+  }
+
+  var body = JSON.parse(rawBody.toString());
   var type = body.type;
   var data = body.data;
   console.log('[HP webhook] type:', type);
@@ -625,6 +681,8 @@ app.get('/api/init-db', async (req, res) => {
     CREATE INDEX IF NOT EXISTS idx_sl_code    ON short_links(code);
     CREATE INDEX IF NOT EXISTS idx_sl_contact ON short_links(contact_id, location_id);
     CREATE INDEX IF NOT EXISTS idx_sl_session ON short_links(session_id);
+    ALTER TABLE merchant_configs ADD COLUMN IF NOT EXISTS handypay_webhook_id VARCHAR(100);
+    ALTER TABLE merchant_configs ADD COLUMN IF NOT EXISTS handypay_webhook_secret VARCHAR(100);
     `);
     res.json({ ok: true, message: 'DB initialized/migrated.' });
   } catch (err) { res.status(500).json({ error: err.message }); }
