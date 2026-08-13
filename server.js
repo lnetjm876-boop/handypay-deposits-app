@@ -768,7 +768,16 @@ app.get('/api/pay', async (req, res) => {
       return res.status(400).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay not configured</h2><p>Please complete setup in HandyPay Settings for locationId: ' + locationId + '</p></body></html>');
     }
     
-  } catch (e) {
+    var row = (await pool.query(
+      "SELECT checkout_url, session_id FROM payment_logs WHERE location_id=$1 AND payment_type='ghl_native' AND status='pending' ORDER BY created_at DESC LIMIT 1",
+      [locationId]
+    )).rows[0];
+    if (!row || !row.checkout_url) {
+      return res.status(404).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay</h2><p>Payment session not ready. Retry from your invoice.</p></body></html>');
+    }
+    console.log('[/api/pay GET] redirect to stored session', row.session_id);
+    return res.redirect(302, row.checkout_url);
+    } catch (e) {
     console.error('[/api/pay GET] ERROR', e.message);
     return res.status(500).send('<h2>HandyPay Error: ' + e.message + '</h2>');
   }
@@ -794,29 +803,5 @@ app.post('/api/re-register', async (req, res) => {
 });
 
 
-
-// ============================================================
-// GHL IFRAME HANDLER - retrieve stored checkout URL from DB
-// ============================================================
-app.get('/api/pay', async (req, res) => {
-  var locationId = req.query.locationId || req.query.location_id || '';
-  if (!locationId) {
-    return res.status(400).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay Error</h2><p>Missing locationId. Please reload the invoice page.</p></body></html>');
-  }
-  try {
-    var row = (await pool.query(
-      "SELECT checkout_url, session_id FROM payment_logs WHERE location_id=$1 AND payment_type=\'ghl_native\' AND status=\'pending\' ORDER BY created_at DESC LIMIT 1",
-      [locationId]
-    )).rows[0];
-    if (!row || !row.checkout_url) {
-      return res.status(404).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay</h2><p>Payment session not ready. Please close this window and try again from your invoice.</p></body></html>');
-    }
-    console.log('[/api/pay GET] redirecting to stored session', row.session_id);
-    return res.redirect(302, row.checkout_url);
-  } catch (e) {
-    console.error('[/api/pay GET] ERROR', e.message);
-    return res.status(500).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay Error</h2><p>' + e.message + '</p></body></html>');
-  }
-});
 
 module.exports = app;
