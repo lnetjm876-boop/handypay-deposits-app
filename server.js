@@ -669,10 +669,14 @@ app.post('/api/pay', async (req, res) => {
   }
 });
 
-app.get(['/api/query', '/api/query/:paymentIntentId'], async (req, res) => {
+app.all(['/api/query', '/api/query/:paymentIntentId'], async (req, res) => {
   // Support both query param AND path param (GHL uses path param format)
+  // Support path param, query param, AND body param (GHL sends POST with body)
   if (req.params && req.params.paymentIntentId && !req.query.paymentIntentId) {
     req.query.paymentIntentId = req.params.paymentIntentId;
+  }
+  if (req.body && (req.body.paymentIntentId || req.body.chargeId || req.body.transactionId) && !req.query.paymentIntentId) {
+    req.query.paymentIntentId = req.body.paymentIntentId || req.body.chargeId || req.body.transactionId;
   }
   try {
     var paymentIntentId = req.query.paymentIntentId || req.query.sessionId || '';
