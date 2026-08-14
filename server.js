@@ -659,8 +659,8 @@ app.get('/api/query', async (req, res) => {
       try {
         var cfg = await getMerchantConfig(log.location_id);
         if (cfg && cfg.handypay_api_key) {
-          var hpResp = var hpSid = (log && log.session_id) ? log.session_id : paymentIntentId;
-    await fetch(HP_BASE + '/payment-sessions/' + hpSid, {
+          var hpSid = (log && log.session_id) ? log.session_id : paymentIntentId;
+    var hpResp = await fetch(HP_BASE + '/payment-sessions/' + hpSid, {
             headers: { 'Authorization': 'Bearer ' + cfg.handypay_api_key }
           });
           if (hpResp.ok) {
