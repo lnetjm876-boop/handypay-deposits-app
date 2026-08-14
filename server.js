@@ -28,7 +28,7 @@ app.get('/success', (req, res) => {
   var sessionId = req.query.session_id || req.query.sessionId || '';
   res.setHeader('Content-Type', 'text/html');
   var sid = JSON.stringify(sessionId);
-  res.send('<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Payment Confirmed</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f0fdf4;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}.card{background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(0,0,0,.08);max-width:420px;width:100%;padding:40px;text-align:center}.icon{font-size:64px;margin-bottom:16px}h1{font-size:22px;font-weight:800;color:#15803d;margin-bottom:10px}p{font-size:15px;color:#555;line-height:1.6}.sub{font-size:13px;color:#888;margin-top:20px}</style></head><body><div class="card"><div class="icon">&#x2705;</div><h1>Payment Confirmed!</h1><p>Thank you. Your payment was received successfully.</p><p class="sub">You may close this window.</p></div><script>var s='+sid+';if(s){try{window.parent.postMessage({type:"PAYMENT_SUCCESS",paymentIntentId:s,status:"succeeded"},"*");window.parent.postMessage({event:"payment-success",paymentIntentId:s},"*");window.parent.postMessage({success:true,paymentIntentId:s,orderId:s},"*");}catch(e){}}setTimeout(function(){try{window.parent.postMessage({type:"PAYMENT_COMPLETE",paymentIntentId:s},"*");}catch(e){}},2000);<\/script></body></html>');
+  res.send('<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Payment Confirmed</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f0fdf4;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}.card{background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(0,0,0,.08);max-width:420px;width:100%;padding:40px;text-align:center}.icon{font-size:64px;margin-bottom:16px}h1{font-size:22px;font-weight:800;color:#15803d;margin-bottom:10px}p{font-size:15px;color:#555;line-height:1.6}.sub{font-size:13px;color:#888;margin-top:20px}</style></head><body><div class="card"><div class="icon">&#x2705;</div><h1>Payment Confirmed!</h1><p>Thank you. Your payment was received successfully.</p><p class="sub">You may close this window.</p></div><script>var s='+sid+';if(s){try{window.parent.postMessage({type:"PAYMENT_SUCCESS",paymentIntentId:s,status:"succeeded"},"*");window.parent.postMessage({event:"payment-success",paymentIntentId:s},"*");if(window.opener){window.opener.postMessage({type:"PAYMENT_SUCCESS",paymentIntentId:s,status:"succeeded"},"*");}window.parent.postMessage({success:true,paymentIntentId:s,orderId:s},"*");}catch(e){}}setTimeout(function(){try{window.parent.postMessage({type:"PAYMENT_COMPLETE",paymentIntentId:s},"*");}catch(e){}},2000);<\/script></body></html>');
 });
 
 app.get('/cancel', (req, res) => {
@@ -854,8 +854,50 @@ app.get('/api/pay', async (req, res) => {
          ON CONFLICT (session_id) DO UPDATE SET checkout_url=$5,updated_at=NOW()`,
         [sessionId, locationId, contactId, Math.round(amountJMD), checkoutUrl]
       );
-      console.log('[/api/pay GET] redirecting to HandyPay:', sessionId, amountJMD);
-      return res.redirect(302, checkoutUrl);
+      console.log('[/api/pay GET] serving open-tab page:', sessionId, amountJMD);
+      var cu = checkoutUrl, sid = sessionId, amt = amountJMD;
+      var openHtml = `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HandyPay</title>
+<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f4f6fb;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px}.card{background:#fff;border-radius:14px;box-shadow:0 4px 24px rgba(0,0,0,.09);padding:28px;max-width:380px;width:100%;text-align:center}.logo{font-size:36px;margin-bottom:10px}h2{color:#D10039;font-size:18px;font-weight:800;margin-bottom:4px}.amt{font-size:28px;font-weight:900;color:#1a1a1a;margin:12px 0}.lbl{font-size:12px;color:#888;margin-bottom:16px}.btn{width:100%;background:#D10039;color:#fff;border:none;border-radius:9px;padding:14px;font-size:15px;font-weight:700;cursor:pointer;margin-bottom:10px}.btn:disabled{background:#ccc}.st{font-size:13px;color:#555;margin-top:6px}</style></head>
+<body><div class="card"><div class="logo">&#x1F4B3;</div><h2>HandyPay</h2>
+<div class="amt">J${ amt.toLocaleString() }</div>
+<div class="lbl">Invoice Payment</div>
+<button class="btn" id="btn" onclick="openHP()">Open HandyPay Checkout</button>
+<div class="st" id="st">Click above to complete your payment</div>
+</div>
+<script>
+var URL=\`${ cu }\`, SID=\`${ sid }\`, done=false;
+function openHP(){
+  if(done)return; done=true;
+  document.getElementById('btn').disabled=true;
+  document.getElementById('st').textContent='Opening HandyPay...';
+  var w=window.open(URL,'_blank','noopener');
+  if(!w){document.getElementById('st').textContent='Popup blocked. Click below:';document.getElementById('btn').disabled=false;done=false;return;}
+  document.getElementById('st').textContent='HandyPay opened in new tab. Complete payment there, then return.';
+  // Poll DB every 3s to check if payment completed
+  var poll=setInterval(function(){
+    fetch('/api/query?paymentIntentId='+SID).then(function(r){return r.json();}).then(function(d){
+      if(d.status==='succeeded'){
+        clearInterval(poll);
+        document.getElementById('st').textContent='Payment confirmed! ✅';
+        window.parent.postMessage({type:'PAYMENT_SUCCESS',paymentIntentId:SID,status:'succeeded'},'*');
+        window.parent.postMessage({event:'payment-success',paymentIntentId:SID},'*');
+      }
+    }).catch(function(){});
+  },3000);
+}
+// Auto-open after 1s
+setTimeout(openHP,1000);
+// Also listen for postMessage from success page (if window.open worked)
+window.addEventListener('message',function(e){
+  var d=e.data||{};
+  if(d.paymentIntentId||d.type==='PAYMENT_SUCCESS'){
+    window.parent.postMessage({type:'PAYMENT_SUCCESS',paymentIntentId:d.paymentIntentId||SID,status:'succeeded'},'*');
+    document.getElementById('st').textContent='Payment confirmed! ✅';
+  }
+});
+</script></body></html>`;
+      res.setHeader('Content-Type','text/html');
+      return res.send(openHtml);
     }
 
     // Fallback: show manual input page (amount unknown)
