@@ -674,7 +674,7 @@ app.get('/api/query', async (req, res) => {
             if (hpPayStatus === 'paid' || hpSession.status === 'complete') {
               // Update DB and return succeeded
               await updatePaymentLogStatus(paymentIntentId, 'paid');
-              return res.json({ status: 'succeeded', paymentIntentId: paymentIntentId, chargeId: paymentIntentId, amount: log ? log.amount : 0, currency: 'JMD' });
+              return res.json({ status: 'paid', paymentStatus: 'paid', paymentIntentId: paymentIntentId, chargeId: paymentIntentId, amount: log ? log.amount : 0, currency: 'JMD' });
             }
           }
         }
@@ -848,7 +848,7 @@ app.get('/api/pay', async (req, res) => {
       + 'SID=d.sessionId||d.paymentIntentId||"";var w=window.open(d.checkoutUrl,"_blank");if(!w){ss("Popup blocked");document.getElementById("b").disabled=false;done=false;return;}'
       + 'done=true;ss("\u23F3 HandyPay open in new tab. Return here after paying.");'
       + 'poll=setInterval(function(){if(!SID)return;fetch("/api/query?paymentIntentId="+SID).then(function(r){return r.json();}).then(function(qd){'
-      + 'if(qd.status==="succeeded"){clearInterval(poll);ss("\u2705 Payment confirmed!");'
+      + 'if(qd.status==="succeeded"||qd.status==="paid"){clearInterval(poll);ss("\u2705 Payment confirmed!");'
       + 'window.parent.postMessage(JSON.stringify({type:"custom_element_success_response",chargeId:SID}),"*");'
       + 'setTimeout(function(){window.parent.postMessage(JSON.stringify({type:"custom_element_close_response"}),"*");},1500);}}).catch(function(){});},3000);'
       + '}).catch(function(e){ss("Error: "+e.message);document.getElementById("b").disabled=false;done=false;});}'
