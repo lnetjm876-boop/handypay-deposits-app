@@ -674,7 +674,22 @@ app.get('/api/query', async (req, res) => {
             if (hpPayStatus === 'paid' || hpSession.status === 'complete') {
               // Update DB and return succeeded
               await updatePaymentLogStatus(paymentIntentId, 'paid');
-              return res.json({ status: 'paid', paymentStatus: 'paid', paymentIntentId: paymentIntentId, chargeId: paymentIntentId, amount: log ? log.amount : 0, currency: 'JMD' });
+              // Mark invoice PAID directly via GHL CRM API — bypasses broken verify/invoice 500
+      if (log && log.entity_id) {
+        try {
+          var cfg2 = cfg || await getMerchantConfig(log.location_id);
+          if (cfg2 && cfg2.ghl_access_token) {
+            var freshTok = await refreshCrmToken(log.location_id).catch(function(){return null;});
+            var useToken = (freshTok && freshTok.access_token) ? freshTok.access_token : cfg2.ghl_access_token;
+            await fetch(GHL_API + '/invoices/' + log.entity_id + '/record-payment', {
+              method: 'POST',
+              headers: { 'Authorization': 'Bearer ' + useToken, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
+              body: JSON.stringify({ altId: log.location_id, altType: 'location', mode: 'card', amount: log.amount / 100, currency: 'JMD', externalPaymentSource: 'HandyPay', notes: 'HP:' + paymentIntentId })
+            }).then(function(rr){ console.log('[record-payment]', log.entity_id, rr.status); }).catch(function(e2){ console.error('[record-payment] err', e2.message); });
+          }
+        } catch(recE) { console.error('[record-payment]', recE.message); }
+      }
+      return res.json({ status: 'paid', paymentStatus: 'paid', paymentIntentId: paymentIntentId, chargeId: paymentIntentId, amount: log ? log.amount : 0, currency: 'JMD' });
             }
           }
         }
@@ -756,6 +771,7 @@ app.get('/api/init-db', async (req, res) => {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
     ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS ghl_transaction_id TEXT;
+    ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS entity_id TEXT;
     CREATE TABLE IF NOT EXISTS debug_messages (
       id SERIAL PRIMARY KEY, location_id TEXT, message TEXT, origin TEXT,
       created_at TIMESTAMPTZ DEFAULT NOW()
@@ -878,10 +894,10 @@ app.post('/api/create-native-session', async (req, res) => {
     var sessionId=session.id||session.sessionId||session.session_id;
     var checkoutUrl=session.url||session.checkout_url||session.checkoutUrl;
     await pool.query(
-      `INSERT INTO payment_logs (session_id,location_id,contact_id,amount,currency,status,payment_type,checkout_url)
-       VALUES ($1,$2,$3,$4,'JMD','pending','ghl_native',$5)
-       ON CONFLICT (session_id) DO UPDATE SET checkout_url=$5,updated_at=NOW()`,
-      [sessionId,locationId,contactId,Math.round(amountJMD),checkoutUrl]
+      `INSERT INTO payment_logs (session_id,location_id,contact_id,amount,currency,status,payment_type,checkout_url,entity_id)
+       VALUES ($1,$2,$3,$4,'JMD','pending','ghl_native',$5,$6)
+       ON CONFLICT (session_id) DO UPDATE SET checkout_url=$5,entity_id=$6,updated_at=NOW()`,
+      [sessionId,locationId,contactId,Math.round(amountJMD),checkoutUrl,entityId||null]
     );
     console.log('[create-native-session] ok:',sessionId);
     return res.json({sessionId,checkoutUrl,paymentIntentId:sessionId});
