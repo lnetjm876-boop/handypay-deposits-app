@@ -811,95 +811,42 @@ app.get('/api/query', async (req, res) => {
 // ============================================================
 // ============================================================
 // ============================================================
-// GHL CUSTOM PAYMENT PROVIDER - CORRECT PROTOCOL (v3)
-// All postMessages must be JSON.stringify'd strings
-// Step 1: Iframe → GHL: JSON.stringify({type:"custom_provider_ready",loaded:true})
-// Step 2: GHL → Iframe: JSON.stringify({type:"payment_initiate_props",amount:X,currency:"JMD",invoiceId:...})
-// Step 3: Iframe → GHL: JSON.stringify({type:"custom_element_success_response",chargeId:"sessionId"})
+// GHL CUSTOM PAYMENT PROVIDER - CORRECT PROTOCOL (v4)
+// All messages must be JSON.stringify() strings, NOT objects
+// custom_provider_ready -> payment_initiate_props -> custom_element_success_response
 // ============================================================
 app.get('/api/pay', async (req, res) => {
   try {
     var q = req.query;
     var locationId = q.locationId || q.location_id || q.altId || '';
     console.log('[/api/pay GET] locationId:', locationId);
-    if (!locationId) {
-      return res.status(400).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay Error</h2><p>Missing locationId.</p></body></html>');
-    }
+    if (!locationId) return res.status(400).send('<html><body><h2>HandyPay Error</h2><p>Missing locationId.</p></body></html>');
     var cfg = await getMerchantConfig(locationId);
-    if (!cfg || !cfg.handypay_api_key) {
-      return res.status(400).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay not configured</h2><p>Open HandyPay Settings to connect.</p></body></html>');
-    }
-    var locId = locationId;
-    var html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HandyPay</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f4f6fb;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px}.card{background:#fff;border-radius:14px;box-shadow:0 4px 24px rgba(0,0,0,.09);padding:28px;max-width:380px;width:100%;text-align:center}.logo{font-size:36px;margin-bottom:10px}h2{color:#D10039;font-size:18px;font-weight:800;margin-bottom:4px}.amt{font-size:30px;font-weight:900;color:#1a1a1a;margin:10px 0}.lbl{font-size:13px;color:#888;margin-bottom:14px}.btn{width:100%;background:#D10039;color:#fff;border:none;border-radius:9px;padding:13px;font-size:15px;font-weight:700;cursor:pointer;margin-bottom:8px}.btn:disabled{background:#ccc}.st{font-size:13px;color:#555;margin-top:4px}.err{color:#b91c1c}</style></head><body><div class="card"><div class="logo">&#x1F4B3;</div><h2>HandyPay</h2><div class="amt" id="amt-disp" style="display:none"></div><div class="lbl" id="lbl">Loading payment details...</div><button class="btn" id="btn" onclick="openHP()" style="display:none">Open HandyPay Checkout</button><div class="st" id="st"></div></div><script>var LOC="${ locId }",done=false,SID='',poll=null,AMT=0,DESC='Invoice Payment',INV='';function jmdFrom(raw,cur){var n=parseFloat(raw)||0;if(!n)return 0;cur=(cur||'').toUpperCase();if(cur==='USD')return Math.round((n>=100?n/100:n)*155);return n;}function setStatus(s){document.getElementById('st').textContent=s;}function openHP(){if(done)return;document.getElementById('btn').disabled=true;setStatus('Opening HandyPay...');fetch('/api/create-native-session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({locationId:LOC,amountJMD:AMT,description:DESC,entityId:INV})}).then(function(r){return r.json();}).then(function(d){if(!d.checkoutUrl){setStatus('Error: '+(d.error||'?'));document.getElementById('btn').disabled=false;return;}SID=d.sessionId||d.paymentIntentId||'';var w=window.open(d.checkoutUrl,'_blank');if(!w){setStatus('Popup blocked. Click: ');document.getElementById('btn').disabled=false;done=false;return;}done=true;setStatus('&#x23F3; HandyPay open in new tab. Return here after paying.');poll=setInterval(function(){if(!SID)return;fetch('/api/query?paymentIntentId='+SID).then(function(r){return r.json();}).then(function(qd){if(qd.status==='succeeded'){clearInterval(poll);setStatus('&#x2705; Payment confirmed!');window.parent.postMessage(JSON.stringify({type:'custom_element_success_response',chargeId:SID}),'*');setTimeout(function(){window.parent.postMessage(JSON.stringify({type:'custom_element_close_response'}),'*');},1500);}}).catch(function(){});},3000);}).catch(function(e){setStatus('Error: '+e.message);document.getElementById('btn').disabled=false;done=false;});}window.addEventListener('message',function(e){var data;try{data=JSON.parse(e.data);}catch(x){return;}console.log('[HP] msg:',data.type);if(data.type==='payment_initiate_props'){AMT=jmdFrom(data.amount,data.currency);DESC=data.description||data.name||'Invoice Payment';INV=data.invoiceId||data.orderId||'';document.getElementById('amt-disp').textContent='J
-
-app.post('/api/create-native-session', async (req, res) => {
-  try {
-    var locationId=req.body.locationId, amountJMD=parseFloat(req.body.amountJMD)||0;
-    var description=req.body.description||'Invoice Payment', contactId=req.body.contactId||'', entityId=req.body.entityId||'';
-    console.log('[create-native-session]',locationId,amountJMD);
-    if(!locationId||amountJMD<80) return res.status(400).json({error:'Need locationId+amountJMD>=80. Got:'+amountJMD});
-    var cfg=await getMerchantConfig(locationId);
-    if(!cfg||!cfg.handypay_api_key) return res.status(400).json({error:'Not configured: '+locationId});
-    var session=await createHandyPaySession(cfg.handypay_api_key,amountJMD,description,
-      {contact_id:contactId,location_id:locationId,entity_id:entityId,payment_type:'ghl_native'},true);
-    var sessionId=session.id||session.sessionId||session.session_id;
-    var checkoutUrl=session.url||session.checkout_url||session.checkoutUrl;
-    await pool.query(
-      `INSERT INTO payment_logs (session_id,location_id,contact_id,amount,currency,status,payment_type,checkout_url)
-       VALUES ($1,$2,$3,$4,'JMD','pending','ghl_native',$5)
-       ON CONFLICT (session_id) DO UPDATE SET checkout_url=$5,updated_at=NOW()`,
-      [sessionId,locationId,contactId,Math.round(amountJMD),checkoutUrl]
-    );
-    console.log('[create-native-session] ok:',sessionId);
-    return res.json({sessionId,checkoutUrl,paymentIntentId:sessionId});
-  } catch(e){
-    console.error('[create-native-session] ERR:',e.message);
-    return res.status(500).json({error:e.message});
-  }
-});
-
-// ============================================================
-// DEBUG MESSAGE CAPTURE (postMessages from GHL iframe)
-// ============================================================
-app.post('/api/debug-message', async (req, res) => {
-  try {
-    await pool.query('INSERT INTO debug_messages (location_id,message,origin) VALUES ($1,$2,$3)',
-      [req.body.locationId||'',JSON.stringify(req.body.message||{}),req.body.origin||'']).catch(function(){});
-    return res.json({ok:true});
-  } catch(e){return res.json({ok:false});}
-});
-
-app.get('/api/debug-messages', async (req, res) => {
-  if(req.query.secret!==process.env.INIT_SECRET) return res.status(403).json({error:'Forbidden'});
-  try {
-    var rows=(await pool.query('SELECT * FROM debug_messages ORDER BY created_at DESC LIMIT 20')).rows;
-    return res.json({count:rows.length,messages:rows});
-  } catch(e){return res.json({error:e.message,note:'Run /api/init-db first'});}
-});
-
-
-app.post('/api/re-register', async (req, res) => {
-  if (req.query.secret !== process.env.INIT_SECRET) return res.status(403).json({ error: 'forbidden' });
-  var locationId = req.query.locationId;
-  if (!locationId) return res.status(400).json({ error: 'Missing locationId' });
-  var cfg = await getMerchantConfig(locationId);
-  if (!cfg) return res.status(404).json({ error: 'Location not found in DB' });
-  var token = cfg.crm_access_token;
-  if (!token) {
-    try { token = await refreshCrmToken(locationId); } catch(e) { return res.status(400).json({ error: 'No CRM token: ' + e.message }); }
-  }
-  var result = await registerPaymentProvider(locationId, token);
-  var result2 = await activatePaymentModes(locationId, token, cfg.handypay_api_key || 'hp_pending_setup', cfg.mode || 'test');
-  return res.json({ ok: true, register: result, activate: result2 });
-});
-
-
-
-module.exports = app;
-+AMT.toLocaleString();document.getElementById('amt-disp').style.display='block';document.getElementById('lbl').textContent='Invoice Payment';document.getElementById('btn').style.display='block';setTimeout(openHP,500);}});try{window.parent.postMessage(JSON.stringify({type:'custom_provider_ready',loaded:true}),'*');}catch(x){setStatus('Blocked: '+x.message);}</script></body></html>`;
+    if (!cfg || !cfg.handypay_api_key) return res.status(400).send('<html><body><h2>HandyPay not configured</h2></body></html>');
+    var html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HandyPay</title>'
+      + '<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f4f6fb;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px}.card{background:#fff;border-radius:14px;box-shadow:0 4px 24px rgba(0,0,0,.09);padding:28px;max-width:380px;width:100%;text-align:center}.logo{font-size:36px;margin-bottom:10px}h2{color:#D10039;font-size:18px;font-weight:800;margin-bottom:4px}.amt{font-size:30px;font-weight:900;color:#1a1a1a;margin:10px 0;display:none}.lbl{font-size:13px;color:#888;margin-bottom:14px}.btn{width:100%;background:#D10039;color:#fff;border:none;border-radius:9px;padding:13px;font-size:15px;font-weight:700;cursor:pointer;display:none}.btn:disabled{background:#ccc}.st{font-size:13px;color:#555;margin-top:6px}</style>'
+      + '</head><body><div class="card"><div class="logo">&#x1F4B3;</div><h2>HandyPay</h2><div class="amt" id="a"></div><div class="lbl" id="l">Loading payment details...</div><button class="btn" id="b" onclick="openHP()">Open HandyPay Checkout</button><div class="st" id="s"></div></div>'
+      + '<script>var L="' + locationId + '",done=false,SID="",poll=null,AMT=0,DESC="Invoice Payment",INV="";'
+      + 'function ss(t){document.getElementById("s").textContent=t;}'
+      + 'function jmd(raw,cur){var n=parseFloat(raw)||0;if(!n)return 0;cur=(cur||("")).toUpperCase();if(cur==="USD")return Math.round((n>=100?n/100:n)*155);return n;}'
+      + 'function openHP(){if(done)return;document.getElementById("b").disabled=true;ss("Opening HandyPay...");'
+      + 'fetch("/api/create-native-session",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({locationId:L,amountJMD:AMT,description:DESC,entityId:INV})})'
+      + '.then(function(r){return r.json();}).then(function(d){if(!d.checkoutUrl){ss("Error: "+(d.error||"?"));document.getElementById("b").disabled=false;return;}'
+      + 'SID=d.sessionId||d.paymentIntentId||"";var w=window.open(d.checkoutUrl,"_blank");if(!w){ss("Popup blocked");document.getElementById("b").disabled=false;done=false;return;}'
+      + 'done=true;ss("\u23F3 HandyPay open in new tab. Return here after paying.");'
+      + 'poll=setInterval(function(){if(!SID)return;fetch("/api/query?paymentIntentId="+SID).then(function(r){return r.json();}).then(function(qd){'
+      + 'if(qd.status==="succeeded"){clearInterval(poll);ss("\u2705 Payment confirmed!");'
+      + 'window.parent.postMessage(JSON.stringify({type:"custom_element_success_response",chargeId:SID}),"*");'
+      + 'setTimeout(function(){window.parent.postMessage(JSON.stringify({type:"custom_element_close_response"}),"*");},1500);}}).catch(function(){});},3000);'
+      + '}).catch(function(e){ss("Error: "+e.message);document.getElementById("b").disabled=false;done=false;});}'
+      + 'window.addEventListener("message",function(e){var data;try{data=JSON.parse(e.data);}catch(x){return;}'
+      + 'if(data.type==="payment_initiate_props"){AMT=jmd(data.amount,data.currency);DESC=data.description||data.name||"Invoice Payment";INV=data.invoiceId||data.orderId||"";'
+      + 'document.getElementById("a").textContent="J$"+AMT.toLocaleString();document.getElementById("a").style.display="block";document.getElementById("l").textContent="Invoice Payment";document.getElementById("b").style.display="block";setTimeout(openHP,500);}});'
+      + 'try{window.parent.postMessage(JSON.stringify({type:"custom_provider_ready",loaded:true}),"*");}catch(x){ss("Blocked: "+x.message);}'
+      + '<\/script></body></html>';
     res.setHeader('Content-Type','text/html');
     return res.send(html);
-  } catch (e) {
+  } catch(e) {
     console.error('[/api/pay GET] CRASH:', e.message);
     return res.status(500).send('<h2>HandyPay Error: ' + e.message + '</h2>');
   }
