@@ -648,7 +648,12 @@ app.get('/api/query', async (req, res) => {
     var paymentIntentId = req.query.paymentIntentId || req.query.sessionId || '';
     console.log('[/api/query GET] paymentIntentId:', paymentIntentId);
     if (!paymentIntentId) return res.json({ status: 'pending' });
+    // Look up by HandyPay session_id OR by GHL transaction_id
     var log = await getPaymentLogBySession(paymentIntentId);
+    if (!log) {
+      var rows2 = (await pool.query('SELECT * FROM payment_logs WHERE ghl_transaction_id=$1 ORDER BY created_at DESC LIMIT 1', [paymentIntentId]).catch(function(){return {rows:[]};} )).rows;
+      if (rows2 && rows2.length) log = rows2[0];
+    }
     var status = (log && log.status) || 'pending';
     // If DB shows pending AND it's a ghl_native session, verify directly with HandyPay API
     if ((status === 'pending' || status === 'paid') && log && log.payment_type === 'ghl_native') {
@@ -747,6 +752,11 @@ app.get('/api/init-db', async (req, res) => {
       id SERIAL PRIMARY KEY, location_id TEXT, message TEXT, origin TEXT,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+    ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS ghl_transaction_id TEXT;
+    CREATE TABLE IF NOT EXISTS debug_messages (
+      id SERIAL PRIMARY KEY, location_id TEXT, message TEXT, origin TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
     `);
     res.json({ ok: true, message: 'DB initialized/migrated.' });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -830,7 +840,7 @@ app.get('/api/pay', async (req, res) => {
       + 'function ss(t){document.getElementById("s").textContent=t;}'
       + 'function jmd(raw,cur){var n=parseFloat(raw)||0;if(!n)return 0;cur=(cur||("")).toUpperCase();if(cur==="USD")return Math.round((n>=100?n/100:n)*155);return n;}'
       + 'function openHP(){if(done)return;document.getElementById("b").disabled=true;ss("Opening HandyPay...");'
-      + 'fetch("/api/create-native-session",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({locationId:L,amountJMD:AMT,description:DESC,entityId:INV})})'
+      + 'fetch("/api/create-native-session",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({locationId:L,amountJMD:AMT,description:DESC,entityId:INV,ghlTransactionId:window._GHL_TXN||""})})'
       + '.then(function(r){return r.json();}).then(function(d){if(!d.checkoutUrl){ss("Error: "+(d.error||"?"));document.getElementById("b").disabled=false;return;}'
       + 'SID=d.sessionId||d.paymentIntentId||"";var w=window.open(d.checkoutUrl,"_blank");if(!w){ss("Popup blocked");document.getElementById("b").disabled=false;done=false;return;}'
       + 'done=true;ss("\u23F3 HandyPay open in new tab. Return here after paying.");'
