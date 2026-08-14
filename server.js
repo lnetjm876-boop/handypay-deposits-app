@@ -32,8 +32,26 @@ app.get('/', (req, res) => res.json({ status: 'ok', service: 'HandyPay Deposits 
 // ============================================================
 // SUCCESS / CANCEL PAGES
 // ============================================================
-app.get('/success', (req, res) => {
+app.get('/success', async (req, res) => {
   var sessionId = req.query.session_id || req.query.sessionId || '';
+  // Server-side: mark payment as paid + call GHL record-payment
+  if (sessionId) {
+    try {
+      await updatePaymentLogStatus(sessionId, 'paid');
+      var sLog = await getPaymentLogBySession(sessionId);
+      if (sLog && sLog.appointment_id && sLog.location_id) {
+        var sCfg = await getMerchantConfig(sLog.location_id).catch(function(){return null;});
+        if (sCfg && sCfg.ghl_access_token) {
+          var sTok = sCfg.ghl_access_token;
+          try { var sRef = await refreshCrmToken(sLog.location_id); if (sRef && sRef.access_token) sTok = sRef.access_token; } catch(e2){}
+          fetch(GHL_API + '/invoices/' + sLog.appointment_id + '/record-payment', {
+            method: 'POST', headers: { 'Authorization': 'Bearer ' + sTok, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
+            body: JSON.stringify({ altId: sLog.location_id, altType: 'location', amount: sLog.amount, currency: 'JMD', paymentMethod: 'custom', source: 'custom', notes: 'HandyPay:' + sessionId })
+          }).then(function(rp){ console.log('[/success] record-payment', sLog.appointment_id, rp.status); }).catch(function(e3){ console.error('[/success] record-payment err', e3.message); });
+        }
+      }
+    } catch(sErr) { console.error('[/success] err:', sErr.message); }
+  }
   res.setHeader('Content-Type', 'text/html');
   var sid = JSON.stringify(sessionId);
   res.send('<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Payment Confirmed</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f0fdf4;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}.card{background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(0,0,0,.08);max-width:420px;width:100%;padding:40px;text-align:center}.icon{font-size:64px;margin-bottom:16px}h1{font-size:22px;font-weight:800;color:#15803d;margin-bottom:10px}p{font-size:15px;color:#555;line-height:1.6}.sub{font-size:13px;color:#888;margin-top:20px}</style></head><body><div class="card"><div class="icon">&#x2705;</div><h1>Payment Confirmed!</h1><p>Thank you. Your payment was received successfully.</p><p class="sub">You may close this window.</p></div><script>var s='+sid+';if(s){try{window.parent.postMessage({type:"PAYMENT_SUCCESS",paymentIntentId:s,status:"succeeded"},"*");window.parent.postMessage({event:"payment-success",paymentIntentId:s},"*");if(window.opener){window.opener.postMessage({type:"PAYMENT_SUCCESS",paymentIntentId:s,status:"succeeded"},"*");}window.parent.postMessage({success:true,paymentIntentId:s,orderId:s},"*");}catch(e){}}setTimeout(function(){try{window.parent.postMessage({type:"PAYMENT_COMPLETE",paymentIntentId:s},"*");}catch(e){}},2000);<\/script></body></html>');
