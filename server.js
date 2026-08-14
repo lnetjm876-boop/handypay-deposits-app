@@ -922,7 +922,16 @@ function pay(){
   done=true;document.getElementById('st').textContent='Creating session...';
   fetch('/api/create-native-session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({locationId:L,amountJMD:a,description:'Invoice Payment'})})
   .then(function(r){return r.json();})
-  .then(function(d){if(d.checkoutUrl)window.location.href=d.checkoutUrl;else{document.getElementById('st').textContent='Error: '+(d.error||'?');document.getElementById('st').className='status err';done=false;}})
+  .then(function(d){
+    if(d.checkoutUrl){
+      var sid=d.sessionId||d.paymentIntentId||'';
+      document.getElementById('st').textContent='Opening HandyPay...';
+      var w=window.open(d.checkoutUrl,'_blank');
+      if(!w){document.getElementById('st').textContent='Popup blocked — click: <a href="'+d.checkoutUrl+'" target="_blank">Open HandyPay</a>';done=false;document.getElementById('btn').disabled=false;return;}
+      document.getElementById('st').textContent='HandyPay opened in new tab. Return here after paying.';
+      if(sid){var poll=setInterval(function(){fetch('/api/query?paymentIntentId='+sid).then(function(r){return r.json();}).then(function(qd){if(qd.status==='succeeded'){clearInterval(poll);document.getElementById('st').textContent='Payment confirmed! ✅';window.parent.postMessage({type:'PAYMENT_SUCCESS',paymentIntentId:sid,status:'succeeded'},'*');}}).catch(function(){});},3000);}
+    }else{document.getElementById('st').textContent='Error: '+(d.error||'?');document.getElementById('st').className='status err';done=false;}
+  })
   .catch(function(e){document.getElementById('st').textContent='Error: '+e.message;done=false;});
 }
 </script>
