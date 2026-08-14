@@ -18,7 +18,7 @@ app.use(express.urlencoded({ extended: true }));
 app.use(function(req, res, next) {
   if (req.path === '/api/debug-messages' || req.path === '/api/health') return next();
   pool.query('INSERT INTO debug_messages (location_id, message, origin) VALUES ($1, $2, $3)',
-    ['req-log', JSON.stringify({ method: req.method, path: req.path, query: req.query, ua: (req.headers['user-agent']||'').substring(0,80), ip: req.ip }), 'request-logger']
+    ['req-log', JSON.stringify({ method: req.method, path: req.path, query: req.query, body: req.method === 'POST' ? req.body : undefined, ua: (req.headers['user-agent']||'').substring(0,80), ip: req.ip }), 'request-logger']
   ).catch(function(){});
   next();
 });
