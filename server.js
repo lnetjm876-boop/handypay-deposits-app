@@ -671,7 +671,7 @@ app.get('/api/query', async (req, res) => {
             if (hpPayStatus === 'paid' || hpSession.status === 'complete') {
               // Update DB and return succeeded
               await updatePaymentLogStatus(paymentIntentId, 'paid');
-              return res.json({ status: 'succeeded', paymentIntentId: paymentIntentId });
+              return res.json({ status: 'succeeded', paymentIntentId: paymentIntentId, chargeId: paymentIntentId, amount: log ? log.amount : 0, currency: 'JMD' });
             }
           }
         }
@@ -851,7 +851,7 @@ app.get('/api/pay', async (req, res) => {
       + '}).catch(function(e){ss("Error: "+e.message);document.getElementById("b").disabled=false;done=false;});}'
       + 'window.addEventListener("message",function(e){var data;try{data=JSON.parse(e.data);}catch(x){return;}'
       + 'if(data.type==="payment_initiate_props"){AMT=jmd(data.amount,data.currency);DESC=data.description||data.name||"Invoice Payment";INV=data.invoiceId||data.orderId||"";'
-      + 'document.getElementById("a").textContent="J$"+AMT.toLocaleString();document.getElementById("a").style.display="block";document.getElementById("l").textContent="Invoice Payment";document.getElementById("b").style.display="block";setTimeout(openHP,500);}});'
+      + 'document.getElementById("a").textContent="J$"+AMT.toLocaleString();document.getElementById("a").style.display="block";document.getElementById("l").textContent="Invoice Payment";document.getElementById("b").style.display="block";}});'
       + 'try{window.parent.postMessage(JSON.stringify({type:"custom_provider_ready",loaded:true}),"*");}catch(x){ss("Blocked: "+x.message);}'
       + '<\/script></body></html>';
     res.setHeader('Content-Type','text/html');
