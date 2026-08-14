@@ -46,7 +46,7 @@ app.get('/success', async (req, res) => {
           try { var sRef = await refreshCrmToken(sLog.location_id); if (sRef && sRef.access_token) sTok = sRef.access_token; } catch(e2){}
           fetch(GHL_API + '/invoices/' + sLog.appointment_id + '/record-payment', {
             method: 'POST', headers: { 'Authorization': 'Bearer ' + sTok, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
-            body: JSON.stringify({ altId: sLog.location_id, altType: 'location', amount: sLog.amount, currency: 'JMD', paymentMethod: 'custom', source: 'custom', notes: 'HandyPay:' + sessionId })
+            body: JSON.stringify({ altId: sLog.location_id, altType: 'location', amount: sLog.amount, currency: 'JMD', paymentMethod: 'custom', source: 'custom', mode: 'live', notes: 'HandyPay:' + sessionId })
           }).then(function(rp){ console.log('[/success] record-payment', sLog.appointment_id, rp.status); }).catch(function(e3){ console.error('[/success] record-payment err', e3.message); });
         }
       }
