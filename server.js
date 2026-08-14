@@ -813,7 +813,7 @@ app.get('/api/pay', async (req, res) => {
     if (token) {
       try {
         // Query GHL for sent/unpaid invoices for this location
-        var invResp = await fetch(GHL_API + '/invoices/?altId=' + locationId + '&altType=location&status=sent&limit=5', {
+        var invResp = await fetch(GHL_API + '/invoices/?altId=' + locationId + '&altType=location&status=sent&limit=5&offset=0', {
           headers: { 'Authorization': 'Bearer ' + token, 'Version': '2021-07-28' }
         });
         if (invResp.status === 401) {
