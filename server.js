@@ -706,7 +706,21 @@ app.all(['/api/query', '/api/query/:paymentIntentId'], async (req, res) => {
               // Update DB and return succeeded
               await updatePaymentLogStatus((log && log.session_id) ? log.session_id : paymentIntentId, 'paid');
               return res.json({ status: 'succeeded', paymentIntentId: paymentIntentId });
-            }
+              // RECORD-PAYMENT: Call GHL API to mark invoice as paid
+              try {
+                if (log && log.appointment_id && log.location_id) {
+                  var rpCfg = cfg || (await getMerchantConfig(log.location_id).catch(function(){return null;}));
+                  if (rpCfg && rpCfg.ghl_access_token) {
+                    var rpTok = rpCfg.ghl_access_token;
+                    try { var rpRef = await refreshCrmToken(log.location_id); if (rpRef && rpRef.access_token) rpTok = rpRef.access_token; } catch(e3){}
+                    fetch(GHL_API + '/invoices/' + log.appointment_id + '/record-payment', {
+                      method: 'POST',
+                      headers: { 'Authorization': 'Bearer ' + rpTok, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
+                      body: JSON.stringify({ altId: log.location_id, altType: 'location', amount: log.amount, currency: 'JMD', paymentMethod: 'custom', source: 'custom', mode: 'live', notes: 'HandyPay:' + ((log && log.session_id) || paymentIntentId) })
+                    }).then(function(rp){ console.log('[query/record-payment]', log.appointment_id, rp.status); }).catch(function(e4){ console.error('[query/record-payment]', e4.message); });
+                  }
+                }
+              } catch(rpErr) { console.error('[query/record-payment]:', rpErr.message); }            }
           }
         }
       } catch (e) { console.error('[/api/query] HP check error:', e.message); }
