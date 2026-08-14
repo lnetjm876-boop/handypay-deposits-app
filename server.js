@@ -604,52 +604,38 @@ app.get('/api/payment-cancel', (req, res) => {
 app.post('/api/pay', async (req, res) => {
   try {
     var body = Buffer.isBuffer(req.body) ? JSON.parse(req.body.toString()) : req.body;
-    var bodyStr = JSON.stringify(body);
-    console.log('[/api/pay POST] FULL BODY:', bodyStr);
-    // Store raw body for debugging
-    pool.query('INSERT INTO debug_messages (location_id,message,origin) VALUES ($1,$2,$3)',
-      ['POST_API_PAY', bodyStr, 'ghl-backend']).catch(function(){});
-    // GHL may send: altId, locationId; amount in multiple formats
-    var locationId = body.altId || body.locationId || body.location_id || '';
-    // Try every possible amount field name
-    var rawAmount = body.amountCents || body.amount || body.total || body.subtotal ||
-      (body.meta && body.meta.amount) || (body.payment && body.payment.amount) || 0;
-    var rawAmountNum = parseFloat(rawAmount) || 0;
-    var currency = (body.currency || body.currencyCode || 'JMD').toUpperCase();
-    // If currency is USD and amount looks like dollars, convert to JMD
-    var amountJMD;
-    if (currency === 'USD') {
-      var usd = rawAmountNum >= 100 ? rawAmountNum / 100 : rawAmountNum;
-      amountJMD = Math.round(usd * 155);
-    } else {
-      // JMD: if value >= 10000 assume cents, divide by 100
-      amountJMD = rawAmountNum >= 10000 ? rawAmountNum / 100 : rawAmountNum;
-    }
+    console.log('[/api/pay POST] body:', JSON.stringify(body).substring(0, 400));
+    // GHL sends altId (not locationId) and amountCents (in cents, not dollars)
+    var locationId = body.altId || body.locationId || '';
+    var amountCents = parseInt(body.amountCents) || 0;
+    var amountJMD = amountCents / 100;
     var contactId = body.contactId || body.contact_id || '';
-    var entityId = body.entityId || body.invoiceId || body.entity_id || '';
-    var description = body.description || body.entityType || body.entity_type || 'Invoice Payment';
-    console.log('[/api/pay POST] locationId:', locationId, 'rawAmount:', rawAmountNum, 'currency:', currency, 'amountJMD:', amountJMD);
-    if (!locationId) return res.status(400).json({ error: 'Missing locationId. Body: ' + bodyStr.substring(0,200) });
-    if (amountJMD < 1) return res.status(400).json({ error: 'Amount is 0. rawAmount=' + rawAmountNum + ' body=' + bodyStr.substring(0,200) });
+    var entityId = body.entityId || body.invoiceId || '';
+    var description = body.description || body.entityType || 'Invoice Payment';
+    console.log('[/api/pay POST] locationId:', locationId, 'amountCents:', amountCents, 'amountJMD:', amountJMD);
+    if (!locationId) return res.status(400).json({ error: 'Missing locationId/altId' });
+    if (amountJMD < 80) return res.status(400).json({ error: 'Amount too low, minimum J$80' });
     var cfg = await getMerchantConfig(locationId);
     if (!cfg || !cfg.handypay_api_key) {
-      return res.status(400).json({ error: 'HandyPay not configured for: ' + locationId });
+      return res.status(400).json({ error: 'HandyPay not configured for location: ' + locationId });
     }
     var session = await createHandyPaySession(
-      cfg.handypay_api_key, Math.max(amountJMD, 80),
+      cfg.handypay_api_key,
+      amountJMD,
       description,
       { contact_id: contactId, location_id: locationId, entity_id: entityId, payment_type: 'ghl_native' },
       true
     );
     var sessionId = session.id || session.sessionId || session.session_id;
     var checkoutUrl = session.url || session.checkout_url || session.checkoutUrl;
+    // Store in DB so GET /api/pay can look up checkout_url
     await pool.query(
       `INSERT INTO payment_logs (session_id, location_id, contact_id, amount, currency, status, payment_type, checkout_url)
-       VALUES ($1, $2, $3, $4, $5, 'pending', 'ghl_native', $6)
-       ON CONFLICT (session_id) DO UPDATE SET checkout_url=$6, updated_at=NOW()`,
-      [sessionId, locationId, contactId, Math.round(amountJMD), currency, checkoutUrl]
+       VALUES ($1, $2, $3, $4, 'JMD', 'pending', 'ghl_native', $5)
+       ON CONFLICT (session_id) DO UPDATE SET checkout_url=$5, updated_at=NOW()`,
+      [sessionId, locationId, contactId, Math.round(amountJMD), checkoutUrl]
     );
-    console.log('[/api/pay POST] OK session:', sessionId);
+    console.log('[/api/pay POST] stored session:', sessionId, checkoutUrl);
     return res.json({ paymentIntentId: sessionId, checkoutUrl: checkoutUrl });
   } catch (err) {
     console.error('[/api/pay POST] ERROR:', err.message);
@@ -802,108 +788,111 @@ app.get('/api/query', async (req, res) => {
 
 // ============================================================
 // ============================================================
-// GHL PAYMENT IFRAME PAGE (postMessage architecture)
-// GHL opens this URL in an iframe. We serve an HTML page that:
-// 1. Listens for GHL's postMessage with payment amount
-// 2. Creates HandyPay session via /api/create-native-session
-// 3. Redirects iframe to HandyPay checkout
-// 4. On success, /success page sends paymentIntentId back to GHL via postMessage
+// ============================================================
+// GHL PAYMENT IFRAME - SERVER-SIDE INVOICE LOOKUP + REDIRECT
+// GHL opens GET /api/pay?locationId=xxx (only locationId sent)
+// We look up pending invoices via CRM API, create HandyPay session, redirect
 // ============================================================
 app.get('/api/pay', async (req, res) => {
   try {
     var q = req.query;
-    console.log('[/api/pay GET] params:', JSON.stringify(q));
     var locationId = q.locationId || q.location_id || q.altId || '';
+    console.log('[/api/pay GET] locationId:', locationId, 'all params:', JSON.stringify(q));
     if (!locationId) {
-      return res.status(400).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay Error</h2><p>Missing locationId.</p><pre>' + JSON.stringify(q, null, 2) + '</pre></body></html>');
+      return res.status(400).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay Error</h2><p>Missing locationId. Params: ' + JSON.stringify(q) + '</p></body></html>');
     }
     var cfg = await getMerchantConfig(locationId);
     if (!cfg || !cfg.handypay_api_key) {
-      return res.status(400).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay not configured</h2><p>Complete setup in HandyPay Settings.</p></body></html>');
+      return res.status(400).send('<html><body style="font-family:sans-serif;padding:40px"><h2>HandyPay not configured</h2><p>Open HandyPay Settings to connect.</p></body></html>');
     }
+
+    // Try to get CRM token + look up pending invoices
+    var token = cfg.crm_access_token;
+    var amountJMD = 0, description = 'Invoice Payment', contactId = '', entityId = '';
+
+    if (token) {
+      try {
+        // Query GHL for sent/unpaid invoices for this location
+        var invResp = await fetch(GHL_API + '/invoices/?altId=' + locationId + '&altType=location&status=sent&limit=5', {
+          headers: { 'Authorization': 'Bearer ' + token, 'Version': '2021-07-28' }
+        });
+        if (invResp.status === 401) {
+          token = await refreshCrmToken(locationId);
+          invResp = await fetch(GHL_API + '/invoices/?altId=' + locationId + '&altType=location&status=sent&limit=5', {
+            headers: { 'Authorization': 'Bearer ' + token, 'Version': '2021-07-28' }
+          });
+        }
+        var invData = await invResp.json();
+        var invoices = (invData.data && invData.data.invoices) || invData.invoices || invData.data || [];
+        console.log('[/api/pay GET] invoices found:', invoices.length);
+        if (invoices.length > 0) {
+          var inv = invoices[0]; // most recent unpaid invoice
+          // GHL invoice amounts: total is in the currency (JMD for JMD invoices)
+          var rawTotal = inv.total || inv.amountDue || inv.amount || 0;
+          amountJMD = parseFloat(rawTotal) || 0;
+          description = inv.title || inv.name || 'Invoice ' + (inv.invoiceNumber || '');
+          contactId = (inv.contactDetails && inv.contactDetails.id) || inv.contactId || '';
+          entityId = inv._id || inv.id || '';
+          console.log('[/api/pay GET] invoice:', entityId, 'amount:', amountJMD, 'desc:', description);
+        }
+      } catch (e) {
+        console.error('[/api/pay GET] invoice lookup error:', e.message);
+      }
+    }
+
+    if (amountJMD >= 80) {
+      // Create HandyPay session and redirect immediately
+      var session = await createHandyPaySession(
+        cfg.handypay_api_key, amountJMD, description,
+        { contact_id: contactId, location_id: locationId, entity_id: entityId, payment_type: 'ghl_native' }, true
+      );
+      var sessionId = session.id || session.sessionId || session.session_id;
+      var checkoutUrl = session.url || session.checkout_url || session.checkoutUrl;
+      await pool.query(
+        `INSERT INTO payment_logs (session_id,location_id,contact_id,amount,currency,status,payment_type,checkout_url)
+         VALUES ($1,$2,$3,$4,'JMD','pending','ghl_native',$5)
+         ON CONFLICT (session_id) DO UPDATE SET checkout_url=$5,updated_at=NOW()`,
+        [sessionId, locationId, contactId, Math.round(amountJMD), checkoutUrl]
+      );
+      console.log('[/api/pay GET] redirecting to HandyPay:', sessionId, amountJMD);
+      return res.redirect(302, checkoutUrl);
+    }
+
+    // Fallback: show manual input page (amount unknown)
     var locId = locationId;
     var html = `<!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HandyPay</title>
-<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f4f6fb;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px}.card{background:#fff;border-radius:14px;box-shadow:0 4px 24px rgba(0,0,0,.09);padding:32px;text-align:center;max-width:380px;width:100%}.logo{font-size:40px;margin-bottom:14px}h2{color:#D10039;font-size:18px;font-weight:800;margin-bottom:6px}p{color:#555;font-size:14px;margin-bottom:10px}.spinner{width:36px;height:36px;border:3px solid #f0f0f0;border-top-color:#D10039;border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 14px}@keyframes spin{to{transform:rotate(360deg)}}.err{color:#b91c1c;font-weight:600}pre{font-size:10px;color:#888;text-align:left;white-space:pre-wrap;word-break:break-all;margin-top:10px;background:#f8f8f8;padding:8px;border-radius:6px;max-height:150px;overflow:auto;display:none}</style>
+<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f4f6fb;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px}.card{background:#fff;border-radius:14px;box-shadow:0 4px 24px rgba(0,0,0,.09);padding:28px;max-width:380px;width:100%}.logo{font-size:32px;text-align:center;margin-bottom:10px}h2{color:#D10039;font-size:17px;font-weight:800;text-align:center;margin-bottom:12px}label{display:block;font-size:13px;font-weight:700;color:#333;margin-bottom:4px}input{width:100%;border:1.5px solid #ccc;border-radius:8px;padding:10px;font-size:16px;margin-bottom:12px;outline:none}input:focus{border-color:#D10039}.btn{width:100%;background:#D10039;color:#fff;border:none;border-radius:9px;padding:13px;font-size:15px;font-weight:700;cursor:pointer}.status{font-size:12px;color:#888;text-align:center;margin-top:8px}.err{color:#b91c1c}</style>
 </head>
-<body><div class="card"><div class="logo">&#x1F4B3;</div><h2>HandyPay</h2><div class="spinner" id="spin"></div><p id="msg">Loading payment details...</p><pre id="dbg"></pre></div>
+<body><div class="card"><div class="logo">&#x1F4B3;</div><h2>HandyPay</h2>
+<label>Amount (JMD)</label>
+<input type="number" id="amt" placeholder="e.g. 2000" min="80" step="1" autofocus>
+<button class="btn" onclick="pay()">Pay with HandyPay</button>
+<div class="status" id="st"></div>
+</div>
 <script>
-var LOC="${ locId }",msgs=[],done=false;
-function log(s){var e=document.getElementById('dbg');e.style.display='block';e.textContent+=s+'\n';}
-function setMsg(s,isErr){document.getElementById('msg').textContent=s;if(isErr){document.getElementById('msg').className='err';document.getElementById('spin').style.display='none';}}
-function jmdFrom(raw,cur){var n=parseFloat(raw)||0;if(!n)return 0;cur=(cur||'').toUpperCase();if(cur==='USD')return Math.round((n>=100?n/100:n)*155);return Math.round(n>=10000?n/100:n);}
-function doPayment(jmd,desc,cid,eid){
-  if(done)return;done=true;
-  setMsg('Creating payment for J
-app.post('/api/re-register', async (req, res) => {
-  if (req.query.secret !== process.env.INIT_SECRET) return res.status(403).json({ error: 'forbidden' });
-  var locationId = req.query.locationId;
-  if (!locationId) return res.status(400).json({ error: 'Missing locationId' });
-  var cfg = await getMerchantConfig(locationId);
-  if (!cfg) return res.status(404).json({ error: 'Location not found in DB' });
-  var token = cfg.crm_access_token;
-  if (!token) {
-    try { token = await refreshCrmToken(locationId); } catch(e) { return res.status(400).json({ error: 'No CRM token: ' + e.message }); }
-  }
-  var result = await registerPaymentProvider(locationId, token);
-  var result2 = await activatePaymentModes(locationId, token, cfg.handypay_api_key || 'hp_pending_setup', cfg.mode || 'test');
-  return res.json({ ok: true, register: result, activate: result2 });
-});
-
-
-
-module.exports = app;
-+jmd.toLocaleString()+'...');
-  fetch('/api/create-native-session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({locationId:LOC,amountJMD:jmd,description:desc,contactId:cid,entityId:eid})})
+var L="${ locId }",done=false;
+function pay(){
+  if(done)return;
+  var a=parseFloat(document.getElementById('amt').value)||0;
+  if(a<80){document.getElementById('st').textContent='Min J$80';document.getElementById('st').className='status err';return;}
+  done=true;document.getElementById('st').textContent='Creating session...';
+  fetch('/api/create-native-session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({locationId:L,amountJMD:a,description:'Invoice Payment'})})
   .then(function(r){return r.json();})
-  .then(function(d){if(d.checkoutUrl){setMsg('Redirecting to HandyPay...');window.location.href=d.checkoutUrl;}else{setMsg('Error: '+(d.error||'no checkout URL'),true);log('Backend err: '+JSON.stringify(d));}})
-  .catch(function(e){setMsg('Network error: '+e.message,true);});
+  .then(function(d){if(d.checkoutUrl)window.location.href=d.checkoutUrl;else{document.getElementById('st').textContent='Error: '+(d.error||'?');document.getElementById('st').className='status err';done=false;}})
+  .catch(function(e){document.getElementById('st').textContent='Error: '+e.message;done=false;});
 }
-window.addEventListener('message',function(e){
-  var data=e.data||{};msgs.push(data);
-  var ms=JSON.stringify(data);log('MSG['+e.origin+']: '+ms.substring(0,300));
-  fetch('/api/debug-message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({locationId:LOC,message:data,origin:e.origin})}).catch(function(){});
-  var raw=data.amount||data.amountCents||data.total||(data.payment&&data.payment.amount)||(data.data&&data.data.amount)||0;
-  var cur=data.currency||data.currencyCode||'';
-  var desc=data.description||data.entityType||'Invoice Payment';
-  var cid=data.contactId||'';
-  var eid=data.entityId||data.invoiceId||'';
-  if(raw>0){var jmd=jmdFrom(raw,cur);log('Amount '+raw+' '+cur+' => J
-app.post('/api/re-register', async (req, res) => {
-  if (req.query.secret !== process.env.INIT_SECRET) return res.status(403).json({ error: 'forbidden' });
-  var locationId = req.query.locationId;
-  if (!locationId) return res.status(400).json({ error: 'Missing locationId' });
-  var cfg = await getMerchantConfig(locationId);
-  if (!cfg) return res.status(404).json({ error: 'Location not found in DB' });
-  var token = cfg.crm_access_token;
-  if (!token) {
-    try { token = await refreshCrmToken(locationId); } catch(e) { return res.status(400).json({ error: 'No CRM token: ' + e.message }); }
-  }
-  var result = await registerPaymentProvider(locationId, token);
-  var result2 = await activatePaymentModes(locationId, token, cfg.handypay_api_key || 'hp_pending_setup', cfg.mode || 'test');
-  return res.json({ ok: true, register: result, activate: result2 });
-});
-
-
-
-module.exports = app;
-+jmd);doPayment(jmd,desc,cid,eid);}
-});
-try{window.parent.postMessage({type:'PAYMENT_PROVIDER_READY',provider:'handypay'},'*');window.parent.postMessage({event:'ready',source:'custom-provider'},'*');}catch(x){log('send err:'+x.message);}
-setTimeout(function(){if(done)return;document.getElementById('spin').style.display='none';setMsg('Waiting for payment data from GHL...');log('10s timeout | msgs:'+msgs.length+' | '+JSON.stringify(msgs));},10000);
-</script></body></html>`;
+</script>
+</body></html>`;
     res.setHeader('Content-Type','text/html');
     return res.send(html);
-  } catch(e) {
-    console.error('[/api/pay GET] ERR',e.message);
-    return res.status(500).send('<h2>HandyPay Error: '+e.message+'</h2>');
+  } catch (e) {
+    console.error('[/api/pay GET] CRASH:', e.message);
+    return res.status(500).send('<h2>HandyPay Error: ' + e.message + '</h2>');
   }
 });
 
-// ============================================================
-// NATIVE SESSION CREATION (called by iframe JS)
-// ============================================================
 app.post('/api/create-native-session', async (req, res) => {
   try {
     var locationId=req.body.locationId, amountJMD=parseFloat(req.body.amountJMD)||0;
