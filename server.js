@@ -869,7 +869,7 @@ app.get('/api/pay', async (req, res) => {
       + 'setTimeout(function(){window.parent.postMessage(JSON.stringify({type:"custom_element_close_response"}),"*");},1500);}}).catch(function(){});},3000);'
       + '}).catch(function(e){ss("Error: "+e.message);document.getElementById("b").disabled=false;done=false;});}'
       + 'window.addEventListener("message",function(e){var data;try{data=JSON.parse(e.data);}catch(x){return;}'
-      + 'if(data.type==="payment_initiate_props"){AMT=jmd(data.amount,data.currency);DESC=data.description||data.name||"Invoice Payment";INV=data.invoiceId||data.orderId||"";'
+      + 'if(data.type==="payment_initiate_props"){AMT=jmd(data.amount,data.currency);DESC=data.description||data.name||"Invoice Payment";INV=data.invoiceId||data.orderId||"";window._GHL_TXN=data.transactionId||data.invoiceId||"";'
       + 'document.getElementById("a").textContent="J$"+AMT.toLocaleString();document.getElementById("a").style.display="block";document.getElementById("l").textContent="Invoice Payment";document.getElementById("b").style.display="block";}});'
       + 'try{window.parent.postMessage(JSON.stringify({type:"custom_provider_ready",loaded:true}),"*");}catch(x){ss("Blocked: "+x.message);}'
       + '<\/script></body></html>';
@@ -884,7 +884,7 @@ app.get('/api/pay', async (req, res) => {
 app.post('/api/create-native-session', async (req, res) => {
   try {
     var locationId=req.body.locationId, amountJMD=parseFloat(req.body.amountJMD)||0;
-    var description=req.body.description||'Invoice Payment', contactId=req.body.contactId||'', entityId=req.body.entityId||'';
+    var description=req.body.description||'Invoice Payment', contactId=req.body.contactId||'', entityId=req.body.entityId||'', ghlTransactionId=req.body.ghlTransactionId||'';
     console.log('[create-native-session]',locationId,amountJMD);
     if(!locationId||amountJMD<80) return res.status(400).json({error:'Need locationId+amountJMD>=80. Got:'+amountJMD});
     var cfg=await getMerchantConfig(locationId);
@@ -894,13 +894,13 @@ app.post('/api/create-native-session', async (req, res) => {
     var sessionId=session.id||session.sessionId||session.session_id;
     var checkoutUrl=session.url||session.checkout_url||session.checkoutUrl;
     await pool.query(
-      `INSERT INTO payment_logs (session_id,location_id,contact_id,amount,currency,status,payment_type,checkout_url,entity_id)
-       VALUES ($1,$2,$3,$4,'JMD','pending','ghl_native',$5,$6)
-       ON CONFLICT (session_id) DO UPDATE SET checkout_url=$5,entity_id=$6,updated_at=NOW()`,
-      [sessionId,locationId,contactId,Math.round(amountJMD),checkoutUrl,entityId||null]
+      `INSERT INTO payment_logs (session_id,location_id,contact_id,amount,currency,status,payment_type,checkout_url,appointment_id,ghl_transaction_id)
+    VALUES ($1,$2,$3,$4,'JMD','pending','ghl_native',$5,$6,$7)
+    ON CONFLICT (session_id) DO UPDATE SET checkout_url=$5,appointment_id=$6,ghl_transaction_id=$7,updated_at=NOW()`,
+      [sessionId,locationId,contactId,Math.round(amountJMD),checkoutUrl,entityId||null,ghlTransactionId||null]
     );
     console.log('[create-native-session] ok:',sessionId);
-    return res.json({sessionId,checkoutUrl,paymentIntentId:sessionId});
+    return res.json({sessionId,checkoutUrl,paymentIntentId:ghlTransactionId||sessionId});
   } catch(e){
     console.error('[create-native-session] ERR:',e.message);
     return res.status(500).json({error:e.message});
