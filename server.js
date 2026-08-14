@@ -647,6 +647,9 @@ app.get('/api/query', async (req, res) => {
   try {
     var paymentIntentId = req.query.paymentIntentId || req.query.sessionId || '';
     console.log('[/api/query GET] paymentIntentId:', paymentIntentId);
+    pool.query('INSERT INTO debug_messages (location_id, message, origin) VALUES ($1, $2, $3)', [
+      'query-log', JSON.stringify({ pid: paymentIntentId, q: req.query, ua: (req.headers['user-agent']||'').substring(0,80) }), 'api-query'
+    ]).catch(function() {});
     if (!paymentIntentId) return res.json({ status: 'pending' });
     // Look up by HandyPay session_id OR by GHL transaction_id
     var log = await getPaymentLogBySession(paymentIntentId);
