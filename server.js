@@ -873,9 +873,9 @@ app.post('/api/create-native-session', async (req, res) => {
     var sessionId=session.id||session.sessionId||session.session_id;
     var checkoutUrl=session.url||session.checkout_url||session.checkoutUrl;
     await pool.query(
-      `INSERT INTO payment_logs (session_id,location_id,contact_id,amount,currency,status,payment_type,checkout_url)
-       VALUES ($1,$2,$3,$4,'JMD','pending','ghl_native',$5)
-       ON CONFLICT (session_id) DO UPDATE SET checkout_url=$5,updated_at=NOW()`,
+      `INSERT INTO payment_logs (session_id,location_id,contact_id,amount,currency,status,payment_type,checkout_url,appointment_id,ghl_transaction_id)
+       VALUES ($1,$2,$3,$4,'JMD','pending','ghl_native',$5,$6,$7)
+       ON CONFLICT (session_id) DO UPDATE SET checkout_url=$5,appointment_id=$6,ghl_transaction_id=$7,updated_at=NOW()`,
       [sessionId,locationId,contactId,Math.round(amountJMD),checkoutUrl,entityId||null,ghlTransactionId||null]
     );
     console.log('[create-native-session] ok:',sessionId);
