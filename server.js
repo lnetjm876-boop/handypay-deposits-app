@@ -650,8 +650,30 @@ app.get('/api/query', async (req, res) => {
     if (!paymentIntentId) return res.json({ status: 'pending' });
     var log = await getPaymentLogBySession(paymentIntentId);
     var status = (log && log.status) || 'pending';
-    var ghlStatus = status === 'completed' ? 'succeeded' : status === 'failed' ? 'failed' : status === 'expired' ? 'cancelled' : 'pending';
-    console.log('[/api/query GET] status:', ghlStatus);
+    // If DB shows pending AND it's a ghl_native session, verify directly with HandyPay API
+    if ((status === 'pending' || status === 'paid') && log && log.payment_type === 'ghl_native') {
+      try {
+        var cfg = await getMerchantConfig(log.location_id);
+        if (cfg && cfg.handypay_api_key) {
+          var hpResp = await fetch(HP_BASE + '/payment-sessions/' + paymentIntentId, {
+            headers: { 'Authorization': 'Bearer ' + cfg.handypay_api_key }
+          });
+          if (hpResp.ok) {
+            var hpData = await hpResp.json();
+            var hpSession = hpData.data || hpData;
+            var hpPayStatus = hpSession.payment_status || hpSession.status || '';
+            console.log('[/api/query] HandyPay status for', paymentIntentId, ':', hpPayStatus);
+            if (hpPayStatus === 'paid' || hpSession.status === 'complete') {
+              // Update DB and return succeeded
+              await updatePaymentLogStatus(paymentIntentId, 'paid');
+              return res.json({ status: 'succeeded', paymentIntentId: paymentIntentId });
+            }
+          }
+        }
+      } catch (e) { console.error('[/api/query] HP check error:', e.message); }
+    }
+    var ghlStatus = (status === 'paid' || status === 'completed') ? 'succeeded' : status === 'failed' ? 'failed' : status === 'expired' ? 'cancelled' : 'pending';
+    console.log('[/api/query GET] final status:', ghlStatus);
     return res.json({ status: ghlStatus, paymentIntentId: paymentIntentId });
   } catch (err) {
     console.error('[/api/query GET] ERROR:', err.message);
