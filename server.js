@@ -604,38 +604,52 @@ app.get('/api/payment-cancel', (req, res) => {
 app.post('/api/pay', async (req, res) => {
   try {
     var body = Buffer.isBuffer(req.body) ? JSON.parse(req.body.toString()) : req.body;
-    console.log('[/api/pay POST] body:', JSON.stringify(body).substring(0, 400));
-    // GHL sends altId (not locationId) and amountCents (in cents, not dollars)
-    var locationId = body.altId || body.locationId || '';
-    var amountCents = parseInt(body.amountCents) || 0;
-    var amountJMD = amountCents / 100;
+    var bodyStr = JSON.stringify(body);
+    console.log('[/api/pay POST] FULL BODY:', bodyStr);
+    // Store raw body for debugging
+    pool.query('INSERT INTO debug_messages (location_id,message,origin) VALUES ($1,$2,$3)',
+      ['POST_API_PAY', bodyStr, 'ghl-backend']).catch(function(){});
+    // GHL may send: altId, locationId; amount in multiple formats
+    var locationId = body.altId || body.locationId || body.location_id || '';
+    // Try every possible amount field name
+    var rawAmount = body.amountCents || body.amount || body.total || body.subtotal ||
+      (body.meta && body.meta.amount) || (body.payment && body.payment.amount) || 0;
+    var rawAmountNum = parseFloat(rawAmount) || 0;
+    var currency = (body.currency || body.currencyCode || 'JMD').toUpperCase();
+    // If currency is USD and amount looks like dollars, convert to JMD
+    var amountJMD;
+    if (currency === 'USD') {
+      var usd = rawAmountNum >= 100 ? rawAmountNum / 100 : rawAmountNum;
+      amountJMD = Math.round(usd * 155);
+    } else {
+      // JMD: if value >= 10000 assume cents, divide by 100
+      amountJMD = rawAmountNum >= 10000 ? rawAmountNum / 100 : rawAmountNum;
+    }
     var contactId = body.contactId || body.contact_id || '';
-    var entityId = body.entityId || body.invoiceId || '';
-    var description = body.description || body.entityType || 'Invoice Payment';
-    console.log('[/api/pay POST] locationId:', locationId, 'amountCents:', amountCents, 'amountJMD:', amountJMD);
-    if (!locationId) return res.status(400).json({ error: 'Missing locationId/altId' });
-    if (amountJMD < 80) return res.status(400).json({ error: 'Amount too low, minimum J$80' });
+    var entityId = body.entityId || body.invoiceId || body.entity_id || '';
+    var description = body.description || body.entityType || body.entity_type || 'Invoice Payment';
+    console.log('[/api/pay POST] locationId:', locationId, 'rawAmount:', rawAmountNum, 'currency:', currency, 'amountJMD:', amountJMD);
+    if (!locationId) return res.status(400).json({ error: 'Missing locationId. Body: ' + bodyStr.substring(0,200) });
+    if (amountJMD < 1) return res.status(400).json({ error: 'Amount is 0. rawAmount=' + rawAmountNum + ' body=' + bodyStr.substring(0,200) });
     var cfg = await getMerchantConfig(locationId);
     if (!cfg || !cfg.handypay_api_key) {
-      return res.status(400).json({ error: 'HandyPay not configured for location: ' + locationId });
+      return res.status(400).json({ error: 'HandyPay not configured for: ' + locationId });
     }
     var session = await createHandyPaySession(
-      cfg.handypay_api_key,
-      amountJMD,
+      cfg.handypay_api_key, Math.max(amountJMD, 80),
       description,
       { contact_id: contactId, location_id: locationId, entity_id: entityId, payment_type: 'ghl_native' },
       true
     );
     var sessionId = session.id || session.sessionId || session.session_id;
     var checkoutUrl = session.url || session.checkout_url || session.checkoutUrl;
-    // Store in DB so GET /api/pay can look up checkout_url
     await pool.query(
       `INSERT INTO payment_logs (session_id, location_id, contact_id, amount, currency, status, payment_type, checkout_url)
-       VALUES ($1, $2, $3, $4, 'JMD', 'pending', 'ghl_native', $5)
-       ON CONFLICT (session_id) DO UPDATE SET checkout_url=$5, updated_at=NOW()`,
-      [sessionId, locationId, contactId, Math.round(amountJMD), checkoutUrl]
+       VALUES ($1, $2, $3, $4, $5, 'pending', 'ghl_native', $6)
+       ON CONFLICT (session_id) DO UPDATE SET checkout_url=$6, updated_at=NOW()`,
+      [sessionId, locationId, contactId, Math.round(amountJMD), currency, checkoutUrl]
     );
-    console.log('[/api/pay POST] stored session:', sessionId, checkoutUrl);
+    console.log('[/api/pay POST] OK session:', sessionId);
     return res.json({ paymentIntentId: sessionId, checkoutUrl: checkoutUrl });
   } catch (err) {
     console.error('[/api/pay POST] ERROR:', err.message);
