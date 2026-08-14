@@ -647,11 +647,7 @@ app.get('/api/query', async (req, res) => {
   try {
     var paymentIntentId = req.query.paymentIntentId || req.query.sessionId || '';
     console.log('[/api/query GET] paymentIntentId:', paymentIntentId);
-    pool.query('INSERT INTO debug_messages (location_id, message, origin) VALUES ($1, $2, $3)', [
-      'query-log', JSON.stringify({ pid: paymentIntentId, q: req.query, ua: (req.headers['user-agent']||'').substring(0,80) }), 'api-query'
-    ]).catch(function() {});
     if (!paymentIntentId) return res.json({ status: 'pending' });
-    // Look up by HandyPay session_id OR by GHL transaction_id
     var log = await getPaymentLogBySession(paymentIntentId);
     if (!log) {
       var rows2 = (await pool.query('SELECT * FROM payment_logs WHERE ghl_transaction_id=$1 ORDER BY created_at DESC LIMIT 1', [paymentIntentId]).catch(function(){return {rows:[]};} )).rows;
@@ -663,8 +659,8 @@ app.get('/api/query', async (req, res) => {
       try {
         var cfg = await getMerchantConfig(log.location_id);
         if (cfg && cfg.handypay_api_key) {
-          var hpResp = var hpSessionId = (log && log.session_id) ? log.session_id : paymentIntentId;
-    await fetch(HP_BASE + '/payment-sessions/' + hpSessionId, {
+          var hpResp = var hpSid = (log && log.session_id) ? log.session_id : paymentIntentId;
+    await fetch(HP_BASE + '/payment-sessions/' + hpSid, {
             headers: { 'Authorization': 'Bearer ' + cfg.handypay_api_key }
           });
           if (hpResp.ok) {
@@ -675,22 +671,7 @@ app.get('/api/query', async (req, res) => {
             if (hpPayStatus === 'paid' || hpSession.status === 'complete') {
               // Update DB and return succeeded
               await updatePaymentLogStatus((log && log.session_id) ? log.session_id : paymentIntentId, 'paid');
-              // Mark invoice PAID directly via GHL CRM API — bypasses broken verify/invoice 500
-      if (log && log.appointment_id) {
-        try {
-          var cfg2 = cfg || await getMerchantConfig(log.location_id);
-          if (cfg2 && cfg2.ghl_access_token) {
-            var freshTok = await refreshCrmToken(log.location_id).catch(function(){return null;});
-            var useToken = (freshTok && freshTok.access_token) ? freshTok.access_token : cfg2.ghl_access_token;
-            await fetch(GHL_API + '/invoices/' + log.appointment_id + '/record-payment', {
-              method: 'POST',
-              headers: { 'Authorization': 'Bearer ' + useToken, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
-              body: JSON.stringify({ altId: log.location_id, altType: 'location', mode: 'card', amount: log.amount / 100, currency: 'JMD', externalPaymentSource: 'HandyPay', notes: 'HP:' + paymentIntentId })
-            }).then(function(rr){ console.log('[record-payment]', log.appointment_id, rr.status); }).catch(function(e2){ console.error('[record-payment] err', e2.message); });
-          }
-        } catch(recE) { console.error('[record-payment]', recE.message); }
-      }
-      return res.json({ status: 'paid', paymentStatus: 'paid', paymentIntentId: paymentIntentId, chargeId: paymentIntentId, amount: log ? log.amount : 0, currency: 'JMD' });
+              return res.json({ status: 'succeeded', paymentIntentId: paymentIntentId });
             }
           }
         }
@@ -767,12 +748,9 @@ app.get('/api/init-db', async (req, res) => {
         ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS checkout_url TEXT;
     ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS payment_type TEXT DEFAULT 'deposit';
     ALTER TABLE merchant_configs ADD COLUMN IF NOT EXISTS deposit_percentage INTEGER DEFAULT 30;
-    CREATE TABLE IF NOT EXISTS debug_messages (
-      id SERIAL PRIMARY KEY, location_id TEXT, message TEXT, origin TEXT,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
     ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS ghl_transaction_id TEXT;
-    ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS entity_id TEXT;
+    ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS appointment_id_v2 TEXT;
+    CREATE TABLE IF NOT EXISTS debug_messages (id SERIAL PRIMARY KEY, location_id TEXT, message TEXT, origin TEXT, created_at TIMESTAMPTZ DEFAULT NOW());
     CREATE TABLE IF NOT EXISTS debug_messages (
       id SERIAL PRIMARY KEY, location_id TEXT, message TEXT, origin TEXT,
       created_at TIMESTAMPTZ DEFAULT NOW()
@@ -865,13 +843,13 @@ app.get('/api/pay', async (req, res) => {
       + 'SID=d.sessionId||d.paymentIntentId||"";var w=window.open(d.checkoutUrl,"_blank");if(!w){ss("Popup blocked");document.getElementById("b").disabled=false;done=false;return;}'
       + 'done=true;ss("\u23F3 HandyPay open in new tab. Return here after paying.");'
       + 'poll=setInterval(function(){if(!SID)return;fetch("/api/query?paymentIntentId="+SID).then(function(r){return r.json();}).then(function(qd){'
-      + 'if(qd.status==="succeeded"||qd.status==="paid"){clearInterval(poll);ss("\u2705 Payment confirmed!");'
+      + 'if(qd.status==="succeeded"){clearInterval(poll);ss("\u2705 Payment confirmed!");'
       + 'window.parent.postMessage(JSON.stringify({type:"custom_element_success_response",chargeId:SID}),"*");'
       + 'setTimeout(function(){window.parent.postMessage(JSON.stringify({type:"custom_element_close_response"}),"*");},1500);}}).catch(function(){});},3000);'
       + '}).catch(function(e){ss("Error: "+e.message);document.getElementById("b").disabled=false;done=false;});}'
       + 'window.addEventListener("message",function(e){var data;try{data=JSON.parse(e.data);}catch(x){return;}'
       + 'if(data.type==="payment_initiate_props"){AMT=jmd(data.amount,data.currency);DESC=data.description||data.name||"Invoice Payment";INV=data.invoiceId||data.orderId||"";window._GHL_TXN=data.transactionId||data.invoiceId||"";'
-      + 'document.getElementById("a").textContent="J$"+AMT.toLocaleString();document.getElementById("a").style.display="block";document.getElementById("l").textContent="Invoice Payment";document.getElementById("b").style.display="block";}});'
+      + 'document.getElementById("a").textContent="J$"+AMT.toLocaleString();document.getElementById("a").style.display="block";document.getElementById("l").textContent="Invoice Payment";document.getElementById("b").style.display="block";setTimeout(openHP,500);}});'
       + 'try{window.parent.postMessage(JSON.stringify({type:"custom_provider_ready",loaded:true}),"*");}catch(x){ss("Blocked: "+x.message);}'
       + '<\/script></body></html>';
     res.setHeader('Content-Type','text/html');
@@ -895,9 +873,9 @@ app.post('/api/create-native-session', async (req, res) => {
     var sessionId=session.id||session.sessionId||session.session_id;
     var checkoutUrl=session.url||session.checkout_url||session.checkoutUrl;
     await pool.query(
-      `INSERT INTO payment_logs (session_id,location_id,contact_id,amount,currency,status,payment_type,checkout_url,appointment_id,ghl_transaction_id)
-    VALUES ($1,$2,$3,$4,'JMD','pending','ghl_native',$5,$6,$7)
-    ON CONFLICT (session_id) DO UPDATE SET checkout_url=$5,appointment_id=$6,ghl_transaction_id=$7,updated_at=NOW()`,
+      `INSERT INTO payment_logs (session_id,location_id,contact_id,amount,currency,status,payment_type,checkout_url)
+       VALUES ($1,$2,$3,$4,'JMD','pending','ghl_native',$5)
+       ON CONFLICT (session_id) DO UPDATE SET checkout_url=$5,updated_at=NOW()`,
       [sessionId,locationId,contactId,Math.round(amountJMD),checkoutUrl,entityId||null,ghlTransactionId||null]
     );
     console.log('[create-native-session] ok:',sessionId);
