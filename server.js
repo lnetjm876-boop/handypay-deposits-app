@@ -663,7 +663,8 @@ app.get('/api/query', async (req, res) => {
       try {
         var cfg = await getMerchantConfig(log.location_id);
         if (cfg && cfg.handypay_api_key) {
-          var hpResp = await fetch(HP_BASE + '/payment-sessions/' + paymentIntentId, {
+          var hpResp = var hpSessionId = (log && log.session_id) ? log.session_id : paymentIntentId;
+    await fetch(HP_BASE + '/payment-sessions/' + hpSessionId, {
             headers: { 'Authorization': 'Bearer ' + cfg.handypay_api_key }
           });
           if (hpResp.ok) {
@@ -673,19 +674,19 @@ app.get('/api/query', async (req, res) => {
             console.log('[/api/query] HandyPay status for', paymentIntentId, ':', hpPayStatus);
             if (hpPayStatus === 'paid' || hpSession.status === 'complete') {
               // Update DB and return succeeded
-              await updatePaymentLogStatus(paymentIntentId, 'paid');
+              await updatePaymentLogStatus((log && log.session_id) ? log.session_id : paymentIntentId, 'paid');
               // Mark invoice PAID directly via GHL CRM API — bypasses broken verify/invoice 500
-      if (log && log.entity_id) {
+      if (log && log.appointment_id) {
         try {
           var cfg2 = cfg || await getMerchantConfig(log.location_id);
           if (cfg2 && cfg2.ghl_access_token) {
             var freshTok = await refreshCrmToken(log.location_id).catch(function(){return null;});
             var useToken = (freshTok && freshTok.access_token) ? freshTok.access_token : cfg2.ghl_access_token;
-            await fetch(GHL_API + '/invoices/' + log.entity_id + '/record-payment', {
+            await fetch(GHL_API + '/invoices/' + log.appointment_id + '/record-payment', {
               method: 'POST',
               headers: { 'Authorization': 'Bearer ' + useToken, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
               body: JSON.stringify({ altId: log.location_id, altType: 'location', mode: 'card', amount: log.amount / 100, currency: 'JMD', externalPaymentSource: 'HandyPay', notes: 'HP:' + paymentIntentId })
-            }).then(function(rr){ console.log('[record-payment]', log.entity_id, rr.status); }).catch(function(e2){ console.error('[record-payment] err', e2.message); });
+            }).then(function(rr){ console.log('[record-payment]', log.appointment_id, rr.status); }).catch(function(e2){ console.error('[record-payment] err', e2.message); });
           }
         } catch(recE) { console.error('[record-payment]', recE.message); }
       }
