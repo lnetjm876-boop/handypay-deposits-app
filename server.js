@@ -892,7 +892,7 @@ app.get('/api/pay', async (req, res) => {
       + 'done=true;ss("\u23F3 HandyPay open in new tab. Return here after paying.");'
       + 'poll=setInterval(function(){if(!SID)return;fetch("/api/query?paymentIntentId="+SID).then(function(r){return r.json();}).then(function(qd){'
       + 'if(qd.status==="succeeded"){clearInterval(poll);ss("\u2705 Payment confirmed!");'
-      + 'window.parent.postMessage(JSON.stringify({type:"custom_element_success_response",chargeId:SID}),"*");'
+      + 'window.parent.postMessage(JSON.stringify({type:"custom_element_success_response",chargeId:(window._GHL_TXN||SID)}),"*");'
       + 'setTimeout(function(){window.parent.postMessage(JSON.stringify({type:"custom_element_close_response"}),"*");},1500);}}).catch(function(){});},3000);'
       + '}).catch(function(e){ss("Error: "+e.message);document.getElementById("b").disabled=false;done=false;});}'
       + 'window.addEventListener("message",function(e){var data;try{data=JSON.parse(e.data);}catch(x){return;}'
