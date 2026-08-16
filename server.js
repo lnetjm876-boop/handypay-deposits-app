@@ -931,29 +931,34 @@ app.post('/api/query', async function(req, res) {
       var r2 = await pool.query('SELECT * FROM payment_logs WHERE ghl_transaction_id = $1', [transactionId]);
       log = r2.rows[0] || null;
     }
+    // DB says paid — fast path
     if (log && (log.status === 'paid' || log.status === 'completed')) {
       return res.json({ status: 'succeeded', paymentIntentId: chargeId || transactionId });
     }
-    // Not in DB as paid — verify directly with HandyPay using apiKey GHL sent us
+    // Verify directly with HandyPay using /payment-sessions/ endpoint (same as GET handler)
     var keyToUse = apiKey || (log && log.access_token) || process.env.HANDYPAY_API_KEY;
-    if (keyToUse && chargeId) {
+    var sessionIdToCheck = chargeId || (log && log.session_id);
+    if (keyToUse && sessionIdToCheck) {
       try {
-        var hpRes = await fetch(HP_BASE + '/checkout/sessions/' + chargeId, {
+        var hpRes = await fetch(HP_BASE + '/payment-sessions/' + sessionIdToCheck, {
           headers: { 'Authorization': 'Bearer ' + keyToUse }
         });
-        var hpData = await hpRes.json();
-        var hpStatus = hpData && (hpData.status || hpData.payment_status || '');
+        var hpJson = await hpRes.json();
+        var hpData = hpJson && hpJson.data ? hpJson.data : hpJson;
+        var hpStatus = (hpData && hpData.status) || '';
+        var hpPaymentStatus = (hpData && hpData.payment_status) || '';
         await pool.query('INSERT INTO debug_messages (location_id, message, origin) VALUES ($1, $2, $3)',
-          ['post-query-hp', JSON.stringify({ hpStatus: hpStatus, chargeId: chargeId }), 'post-query-hp']).catch(function(){});
-        if (hpStatus === 'complete' || hpStatus === 'paid' || hpStatus === 'succeeded') {
+          ['post-query', JSON.stringify({ hpStatus: hpStatus, hpPayStatus: hpPaymentStatus }), 'post-query-hp']
+        ).catch(function(){});
+        if (hpStatus === 'complete' || hpPaymentStatus === 'paid' || hpStatus === 'paid') {
           if (log) {
             await pool.query('UPDATE payment_logs SET status=$1, updated_at=NOW() WHERE session_id=$2', ['paid', log.session_id]).catch(function(){});
           }
-          return res.json({ status: 'succeeded', paymentIntentId: chargeId });
+          return res.json({ status: 'succeeded', paymentIntentId: sessionIdToCheck });
         }
       } catch(hpErr) {
         await pool.query('INSERT INTO debug_messages (location_id, message, origin) VALUES ($1, $2, $3)',
-          ['post-query-err', hpErr.message || 'hp_err', 'post-query-catch']).catch(function(){});
+          ['post-query', hpErr.message || 'hp_err', 'post-query-hp-err']).catch(function(){});
       }
     }
     return res.json({ status: 'pending', paymentIntentId: chargeId || transactionId });
