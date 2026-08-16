@@ -908,6 +908,60 @@ app.get('/api/pay', async (req, res) => {
   }
 });
 
+// =================================================================
+// QUERY — POST (GHL backend server calls POST /api/query to verify payment)
+// GHL sends: { chargeId, transactionId, apiKey, type: "verify" }
+// We must return: { status: "succeeded" } for paid sessions
+// =================================================================
+app.post('/api/query', async function(req, res) {
+  var chargeId = req.body.chargeId || req.body.paymentIntentId || req.body.sessionId;
+  var transactionId = req.body.transactionId;
+  var apiKey = req.body.apiKey;
+  await pool.query('INSERT INTO debug_messages (location_id, message, origin) VALUES ($1, $2, $3)',
+    ['post-query', JSON.stringify({ chargeId: chargeId, txn: transactionId, type: req.body.type }), 'post-query-handler']
+  ).catch(function(){});
+  if (!chargeId && !transactionId) return res.json({ status: 'pending' });
+  try {
+    var log = null;
+    if (chargeId) {
+      var r1 = await pool.query('SELECT * FROM payment_logs WHERE session_id = $1', [chargeId]);
+      log = r1.rows[0] || null;
+    }
+    if (!log && transactionId) {
+      var r2 = await pool.query('SELECT * FROM payment_logs WHERE ghl_transaction_id = $1', [transactionId]);
+      log = r2.rows[0] || null;
+    }
+    if (log && (log.status === 'paid' || log.status === 'completed')) {
+      return res.json({ status: 'succeeded', paymentIntentId: chargeId || transactionId });
+    }
+    // Not in DB as paid — verify directly with HandyPay using apiKey GHL sent us
+    var keyToUse = apiKey || (log && log.access_token) || process.env.HANDYPAY_API_KEY;
+    if (keyToUse && chargeId) {
+      try {
+        var hpRes = await fetch(HP_BASE + '/checkout/sessions/' + chargeId, {
+          headers: { 'Authorization': 'Bearer ' + keyToUse }
+        });
+        var hpData = await hpRes.json();
+        var hpStatus = hpData && (hpData.status || hpData.payment_status || '');
+        await pool.query('INSERT INTO debug_messages (location_id, message, origin) VALUES ($1, $2, $3)',
+          ['post-query-hp', JSON.stringify({ hpStatus: hpStatus, chargeId: chargeId }), 'post-query-hp']).catch(function(){});
+        if (hpStatus === 'complete' || hpStatus === 'paid' || hpStatus === 'succeeded') {
+          if (log) {
+            await pool.query('UPDATE payment_logs SET status=$1, updated_at=NOW() WHERE session_id=$2', ['paid', log.session_id]).catch(function(){});
+          }
+          return res.json({ status: 'succeeded', paymentIntentId: chargeId });
+        }
+      } catch(hpErr) {
+        await pool.query('INSERT INTO debug_messages (location_id, message, origin) VALUES ($1, $2, $3)',
+          ['post-query-err', hpErr.message || 'hp_err', 'post-query-catch']).catch(function(){});
+      }
+    }
+    return res.json({ status: 'pending', paymentIntentId: chargeId || transactionId });
+  } catch(err) {
+    return res.json({ status: 'pending', error: err.message });
+  }
+});
+
 app.post('/api/create-native-session', async (req, res) => {
   try {
     var locationId=req.body.locationId, amountJMD=parseFloat(req.body.amountJMD)||0;
