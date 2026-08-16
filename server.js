@@ -897,7 +897,7 @@ app.get('/api/pay', async (req, res) => {
       + 'setTimeout(function(){window.parent.postMessage(JSON.stringify({type:"custom_element_close_response"}),"*");},1500);}}).catch(function(){});},3000);'
       + '}).catch(function(e){ss("Error: "+e.message);document.getElementById("b").disabled=false;done=false;});}'
       + 'window.addEventListener("message",function(e){var data;try{data=JSON.parse(e.data);}catch(x){return;}'
-      + 'if(data.type==="payment_initiate_props"){AMT=jmd(data.amount,data.currency);DESC=data.description||data.name||"Invoice Payment";INV=data.invoiceId||data.orderId||"";window._GHL_TXN=data.transactionId||data.invoiceId||"";'
+      + 'if(data.type==="payment_initiate_props"){AMT=jmd(data.amount,data.currency);DESC=data.description||data.name||"Invoice Payment";INV=data.entityId||data.invoiceId||data.orderId||"";window._GHL_TXN=data.transactionId||data.invoiceId||"";'
       + 'document.getElementById("a").textContent="J$"+AMT.toLocaleString();document.getElementById("a").style.display="block";document.getElementById("l").textContent="Invoice Payment";document.getElementById("b").style.display="block";setTimeout(openHP,500);}});'
       + 'try{window.parent.postMessage(JSON.stringify({type:"custom_provider_ready",loaded:true}),"*");}catch(x){ss("Blocked: "+x.message);}'
       + '<\/script></body></html>';
