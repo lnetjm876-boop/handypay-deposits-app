@@ -41,12 +41,12 @@ app.get('/success', async (req, res) => {
       var sLog = await getPaymentLogBySession(sessionId);
       if (sLog && sLog.appointment_id && sLog.location_id) {
         var sCfg = await getMerchantConfig(sLog.location_id).catch(function(){return null;});
-        if (sCfg && sCfg.ghl_access_token) {
-          var sTok = sCfg.ghl_access_token;
+        if (sCfg && (sCfg.ghl_access_token || sCfg.crm_access_token)) {
+          var sTok = sCfg.crm_access_token || sCfg.ghl_access_token;
           try { var sRef = await refreshCrmToken(sLog.location_id); if (sRef && sRef.access_token) sTok = sRef.access_token; } catch(e2){}
           fetch(GHL_API + '/invoices/' + sLog.appointment_id + '/record-payment', {
             method: 'POST', headers: { 'Authorization': 'Bearer ' + sTok, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
-            body: JSON.stringify({ altId: sLog.location_id, altType: 'location', amount: sLog.amount, currency: 'JMD', paymentMethod: 'custom', source: 'custom', mode: 'live', notes: 'HandyPay:' + sessionId })
+            body: JSON.stringify({ altId: sLog.location_id, altType: 'location', amount: sLog.amount, mode: 'card', notes: 'HandyPay:' + sessionId })
           }).then(function(rp){ console.log('[/success] record-payment', sLog.appointment_id, rp.status); }).catch(function(e3){ console.error('[/success] record-payment err', e3.message); });
         }
       }
@@ -110,19 +110,20 @@ async function getContact(accessToken, contactId) {
 
 async function refreshCrmToken(locationId) {
   const cfg = await getMerchantConfig(locationId);
-  if (!cfg || !cfg.crm_refresh_token) throw new Error('No refresh token');
+  var refreshTok = (cfg && cfg.crm_refresh_token) || (cfg && cfg.ghl_refresh_token) || '';
+  if (!cfg || !refreshTok) throw new Error('No refresh token');
   const r = await fetch(GHL_API + '/oauth/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
       client_id: GHL_CLIENT_ID, client_secret: GHL_CLIENT_SECRET,
-      grant_type: 'refresh_token', refresh_token: cfg.crm_refresh_token
+      grant_type: 'refresh_token', refresh_token: refreshTok
     })
   });
   if (!r.ok) throw new Error('Token refresh ' + r.status);
   const data = await r.json();
   await pool.query(
-    'UPDATE merchant_configs SET crm_access_token=$1, crm_refresh_token=$2, updated_at=NOW() WHERE location_id=$3',
+    'UPDATE merchant_configs SET crm_access_token=$1, crm_refresh_token=$2, ghl_access_token=$1, ghl_refresh_token=$2, updated_at=NOW() WHERE location_id=$3',
     [data.access_token, data.refresh_token, locationId]
   );
   return data.access_token;
