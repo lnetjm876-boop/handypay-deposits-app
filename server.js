@@ -794,6 +794,7 @@ app.get('/api/init-db', async (req, res) => {
     ALTER TABLE merchant_configs ADD COLUMN IF NOT EXISTS handypay_webhook_id VARCHAR(100);
     ALTER TABLE merchant_configs ADD COLUMN IF NOT EXISTS handypay_webhook_secret VARCHAR(100);
         ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS checkout_url TEXT;
+    ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS entity_id VARCHAR(255);
     ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS payment_type TEXT DEFAULT 'deposit';
     ALTER TABLE merchant_configs ADD COLUMN IF NOT EXISTS deposit_percentage INTEGER DEFAULT 30;
     ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS ghl_transaction_id TEXT;
