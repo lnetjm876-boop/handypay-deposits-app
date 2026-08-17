@@ -852,6 +852,7 @@ app.get('/api/init-db', async (req, res) => {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
     `);
+    await pool.query('ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS record_payment_done BOOLEAN').catch(function(){});
     res.json({ ok: true, message: 'DB initialized/migrated.' });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
