@@ -4,9 +4,17 @@
     {
       "src": "server.js",
       "use": "@vercel/node"
+    },
+    {
+      "src": "api/cron-retry.js",
+      "use": "@vercel/node"
     }
   ],
   "routes": [
+    {
+      "src": "/api/cron-retry",
+      "dest": "api/cron-retry.js"
+    },
     {
       "src": "/(.*)",
       "dest": "server.js"
