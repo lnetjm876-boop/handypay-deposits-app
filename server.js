@@ -105,15 +105,22 @@ async function getInvoiceIdByTx(locationId, txId, token) {
 }
 async function fireRecordPayment(invoiceId, locationId, amount, note, token) {
   if (!invoiceId || !token) { console.log('[fireRecordPayment] skipped', invoiceId ? 'no-token' : 'no-invId'); return 0; }
-  try {
-    var rp = await fetch(GHL_API + '/invoices/' + invoiceId + '/record-payment', {
-      method: 'POST', headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
-      body: JSON.stringify({ altId: locationId, altType: 'location', amount: amount, mode: 'card', notes: note })
-    });
-    var rpText = await rp.text();
-    console.log('[fireRecordPayment]', invoiceId, rp.status, rpText.substring(0, 80));
-    return rp.status;
-  } catch(eRp) { console.error('[fireRecordPayment]', eRp.message); return 0; }
+  for (var attempt = 1; attempt <= 3; attempt++) {
+    try {
+      var rp = await fetch(GHL_API + '/invoices/' + invoiceId + '/record-payment', {
+        method: 'POST', headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
+        body: JSON.stringify({ altId: locationId, altType: 'location', amount: amount, mode: 'card', notes: note })
+      });
+      var rpText = await rp.text();
+      console.log('[fireRecordPayment] attempt', attempt, invoiceId, rp.status, rpText.substring(0, 80));
+      if (rp.status === 409 && attempt < 3) {
+        await new Promise(function(resolve) { setTimeout(resolve, 1500 * attempt); });
+        continue;
+      }
+      return rp.status;
+    } catch(eRp) { console.error('[fireRecordPayment]', eRp.message); return 0; }
+  }
+  return 0;
 }
 async function getFreshToken(locationId) {
   var cfg = await getMerchantConfig(locationId).catch(function(){return null;});
