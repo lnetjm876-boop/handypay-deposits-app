@@ -1084,4 +1084,41 @@ app.post('/api/re-register', async (req, res) => {
 
 
 
+
+// ============================================================
+// CRON: retry record-payment for sessions pending > 3 min
+// Vercel cron calls this every 5 min automatically
+// ============================================================
+app.get('/api/cron-retry', async (req, res) => {
+  var sec = req.query.secret || (req.headers['authorization'] || '').replace('Bearer ', '');
+  if (sec !== process.env.INIT_SECRET) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    var rows = (await pool.query(
+      "SELECT * FROM payment_logs WHERE status='paid' AND record_payment_done IS NULL AND created_at < NOW() - INTERVAL '3 minutes' AND location_id IS NOT NULL LIMIT 10"
+    )).rows;
+    var results = [];
+    for (var row of rows) {
+      try {
+        var tok = await getFreshToken(row.location_id);
+        var invId = row.appointment_id || row.entity_id || '';
+        if (!invId && row.ghl_transaction_id) { invId = await getInvoiceIdByTx(row.location_id, row.ghl_transaction_id, tok); }
+        if (invId && tok) {
+          var rpStatus = await fireRecordPayment(invId, row.location_id, row.amount, 'HandyPay-cron:' + row.session_id, tok);
+          if (rpStatus === 201 || rpStatus === 200) {
+            await pool.query('UPDATE payment_logs SET record_payment_done=true WHERE session_id=$1', [row.session_id]);
+            results.push({ session: row.session_id, status: 'done', invoiceId: invId });
+          } else if (rpStatus === 409) {
+            results.push({ session: row.session_id, status: 'still_locked', invoiceId: invId });
+          } else {
+            results.push({ session: row.session_id, status: 'fail_' + rpStatus, invoiceId: invId });
+          }
+        } else {
+          results.push({ session: row.session_id, status: 'no_inv_or_token' });
+        }
+      } catch(eRow) { results.push({ session: row.session_id, status: 'error', msg: eRow.message }); }
+    }
+    return res.json({ ran_at: new Date().toISOString(), processed: results.length, results });
+  } catch(eCron) { return res.status(500).json({ error: eCron.message }); }
+});
+
 module.exports = app;
