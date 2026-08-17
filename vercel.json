@@ -11,5 +11,11 @@
       "src": "/(.*)",
       "dest": "server.js"
     }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron-retry?secret=handypay-init-2026-lnet",
+      "schedule": "*/5 * * * *"
+    }
   ]
 }
