@@ -39,15 +39,13 @@ app.get('/success', async (req, res) => {
     try {
       await updatePaymentLogStatus(sessionId, 'paid');
       var sLog = await getPaymentLogBySession(sessionId);
-      if (sLog && sLog.appointment_id && sLog.location_id) {
-        var sCfg = await getMerchantConfig(sLog.location_id).catch(function(){return null;});
-        if (sCfg && (sCfg.ghl_access_token || sCfg.crm_access_token)) {
-          var sTok = sCfg.crm_access_token || sCfg.ghl_access_token;
-          try { var sRef = await refreshCrmToken(sLog.location_id); if (sRef && sRef.access_token) sTok = sRef.access_token; } catch(e2){}
-          fetch(GHL_API + '/invoices/' + sLog.appointment_id + '/record-payment', {
-            method: 'POST', headers: { 'Authorization': 'Bearer ' + sTok, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
-            body: JSON.stringify({ altId: sLog.location_id, altType: 'location', amount: sLog.amount, mode: 'card', notes: 'HandyPay:' + sessionId })
-          }).then(function(rp){ console.log('[/success] record-payment', sLog.appointment_id, rp.status); }).catch(function(e3){ console.error('[/success] record-payment err', e3.message); });
+      var sInvId = req.query.inv || (sLog && (sLog.appointment_id || sLog.entity_id)) || '';
+      if (sLog && sLog.location_id) {
+        var sTok2 = await getFreshToken(sLog.location_id);
+        if (sTok2) {
+          if (!sInvId && sLog.ghl_transaction_id) { sInvId = await getInvoiceIdByTx(sLog.location_id, sLog.ghl_transaction_id, sTok2); console.log('[/success] tx->inv:', sLog.ghl_transaction_id, '->', sInvId); }
+          if (sInvId) { fireRecordPayment(sInvId, sLog.location_id, sLog.amount, 'HandyPay:' + sessionId, sTok2); }
+          else { console.log('[/success] no invoiceId for session', sessionId); }
         }
       }
     } catch(sErr) { console.error('[/success] err:', sErr.message); }
@@ -94,6 +92,35 @@ async function getPaymentLogBySession(sessionId) {
 }
 async function updatePaymentLogStatus(sessionId, status) {
   await pool.query('UPDATE payment_logs SET status=$1, updated_at=NOW() WHERE session_id=$2', [status, sessionId]);
+}
+async function getInvoiceIdByTx(locationId, txId, token) {
+  if (!txId || !token) return '';
+  try {
+    var r2 = await fetch(GHL_API + '/payments/transactions?altId=' + locationId + '&altType=location&id=' + txId, { headers: { 'Authorization': 'Bearer ' + token, 'Version': '2021-07-28' } });
+    var d2 = await r2.json();
+    var inv = (d2.data && d2.data[0] && d2.data[0].entityId) || '';
+    console.log('[getInvoiceIdByTx]', txId, '->', inv);
+    return inv;
+  } catch(eTx) { console.error('[getInvoiceIdByTx]', eTx.message); return ''; }
+}
+async function fireRecordPayment(invoiceId, locationId, amount, note, token) {
+  if (!invoiceId || !token) { console.log('[fireRecordPayment] skipped', invoiceId ? 'no-token' : 'no-invId'); return 0; }
+  try {
+    var rp = await fetch(GHL_API + '/invoices/' + invoiceId + '/record-payment', {
+      method: 'POST', headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
+      body: JSON.stringify({ altId: locationId, altType: 'location', amount: amount, mode: 'card', notes: note })
+    });
+    var rpText = await rp.text();
+    console.log('[fireRecordPayment]', invoiceId, rp.status, rpText.substring(0, 80));
+    return rp.status;
+  } catch(eRp) { console.error('[fireRecordPayment]', eRp.message); return 0; }
+}
+async function getFreshToken(locationId) {
+  var cfg = await getMerchantConfig(locationId).catch(function(){return null;});
+  if (!cfg) return '';
+  var tok = cfg.crm_access_token || cfg.ghl_access_token || '';
+  try { var fresh = await refreshCrmToken(locationId); if (fresh) tok = fresh; } catch(e){}
+  return tok;
 }
 
 // ============================================================
@@ -207,7 +234,7 @@ async function createHandyPaySession(apiKey, amountJMD, label, meta, passFeesToC
   var payload = {
     line_items: [{ amount: Math.round(amountJMD) * 100, currency: 'jmd', name: label, quantity: 1 }],
     mode: 'payment',
-    success_url: APP_URL + '/success?session_id={CHECKOUT_SESSION_ID}',
+    success_url: APP_URL + '/success?session_id={CHECKOUT_SESSION_ID}' + (meta && meta.inv ? '&inv=' + encodeURIComponent(meta.inv) : ''),
     cancel_url: APP_URL + '/cancel',
     pass_fees_to_customer: passFeesToCustomer !== false,
     metadata: meta
@@ -583,7 +610,18 @@ app.post('/api/webhooks/handypay', async (req, res) => {
     }
     var amount = amountJMD;
     var appointmentId = apptMetaId;
-
+    // For ghl_native invoice sessions: fire record-payment
+    var whPayType = payType2 || (log && log.payment_type) || '';
+    if (whPayType === 'ghl_native' || (log && log.payment_type === 'ghl_native')) {
+      var whInvId = (obj.metadata && (obj.metadata.entity_id || obj.metadata.inv || obj.metadata.appointmentId)) || (log && (log.appointment_id || log.entity_id)) || '';
+      var whLocId = locationId || (log && log.location_id) || '';
+      if (whLocId) {
+        var whTok = await getFreshToken(whLocId);
+        if (!whInvId && log && log.ghl_transaction_id) { whInvId = await getInvoiceIdByTx(whLocId, log.ghl_transaction_id, whTok); }
+        if (whInvId && whTok) { fireRecordPayment(whInvId, whLocId, amount, 'HandyPay-webhook:' + sessionId, whTok); }
+        else { console.log('[webhook] no invId for ghl_native session', sessionId); }
+      }
+    }
     var tagLabel = payType2 === 'full' ? 'paid-in-full' : 'deposit-paid';
     await addContactTag(accessToken, contactId, [tagLabel]);
     await addContactNote(accessToken, contactId,
@@ -933,8 +971,14 @@ app.post('/api/query', async function(req, res) {
       var r2 = await pool.query('SELECT * FROM payment_logs WHERE ghl_transaction_id = $1', [transactionId]);
       log = r2.rows[0] || null;
     }
-    // DB says paid — fast path
+    // DB says paid — fast path: also ensure GHL invoice is marked paid
     if (log && (log.status === 'paid' || log.status === 'completed')) {
+      if (log.location_id) {
+        var qTok = await getFreshToken(log.location_id);
+        var qInvId = log.appointment_id || log.entity_id || '';
+        if (!qInvId && transactionId) { qInvId = await getInvoiceIdByTx(log.location_id, transactionId, qTok); }
+        if (qInvId && qTok) { fireRecordPayment(qInvId, log.location_id, log.amount, 'HandyPay-verify:' + (chargeId || transactionId), qTok); }
+      }
       return res.json({ status: 'succeeded', paymentIntentId: chargeId || transactionId });
     }
     // Verify directly with HandyPay using /payment-sessions/ endpoint (same as GET handler)
@@ -978,7 +1022,7 @@ app.post('/api/create-native-session', async (req, res) => {
     var cfg=await getMerchantConfig(locationId);
     if(!cfg||!cfg.handypay_api_key) return res.status(400).json({error:'Not configured: '+locationId});
     var session=await createHandyPaySession(cfg.handypay_api_key,amountJMD,description,
-      {contact_id:contactId,location_id:locationId,entity_id:entityId,payment_type:'ghl_native'},true);
+      {contact_id:contactId,location_id:locationId,entity_id:entityId,payment_type:'ghl_native',inv:entityId||''},true);
     var sessionId=session.id||session.sessionId||session.session_id;
     var checkoutUrl=session.url||session.checkout_url||session.checkoutUrl;
     await pool.query(
