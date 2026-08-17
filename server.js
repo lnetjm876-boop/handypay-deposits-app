@@ -852,7 +852,6 @@ app.get('/api/init-db', async (req, res) => {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
     `);
-    await pool.query('ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS record_payment_done BOOLEAN').catch(function(){});
     res.json({ ok: true, message: 'DB initialized/migrated.' });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1095,7 +1094,7 @@ app.get('/api/cron-retry', async (req, res) => {
   if (sec !== process.env.INIT_SECRET) return res.status(401).json({ error: 'unauthorized' });
   try {
     var rows = (await pool.query(
-      "SELECT * FROM payment_logs WHERE status='paid' AND record_payment_done IS NULL AND created_at < NOW() - INTERVAL '3 minutes' AND location_id IS NOT NULL LIMIT 10"
+      "SELECT * FROM payment_logs WHERE status='paid' AND created_at < NOW() - INTERVAL '3 minutes' AND created_at > NOW() - INTERVAL '60 minutes' AND location_id IS NOT NULL LIMIT 10"
     )).rows;
     var results = [];
     for (var row of rows) {
@@ -1106,7 +1105,6 @@ app.get('/api/cron-retry', async (req, res) => {
         if (invId && tok) {
           var rpStatus = await fireRecordPayment(invId, row.location_id, row.amount, 'HandyPay-cron:' + row.session_id, tok);
           if (rpStatus === 201 || rpStatus === 200) {
-            await pool.query('UPDATE payment_logs SET record_payment_done=true WHERE session_id=$1', [row.session_id]);
             results.push({ session: row.session_id, status: 'done', invoiceId: invId });
           } else if (rpStatus === 409) {
             results.push({ session: row.session_id, status: 'still_locked', invoiceId: invId });
