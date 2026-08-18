@@ -414,7 +414,6 @@ app.post('/api/settings', async (req, res) => {
     if (rows[0] && rows[0].crm_access_token) {
       await registerPaymentProvider(location_id, rows[0].crm_access_token);
       await activatePaymentModes(location_id, rows[0].crm_access_token, handypay_api_key, mode || 'test');
-      await activatePaymentModes(location_id, rows[0].crm_access_token, handypay_api_key, mode || 'test');
     }
     await registerHandyPayWebhook(handypay_api_key, location_id);
     res.redirect('/api/settings?location_id=' + location_id + '&saved=true');
@@ -489,14 +488,14 @@ app.post('/api/webhooks/crm', async (req, res) => {
   }
   try {
     await pool.query('INSERT INTO payment_logs (session_id,contact_id,location_id,appointment_id,amount,currency,status,access_token,payment_type) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (session_id) DO NOTHING',
-      [depositSession.id,contactId,locationId,title,depositAmt,'jmd','pending',token,'deposit']);
+      [depositSession.id,contactId,locationId,appointmentId,depositAmt,'jmd','pending',token,'deposit']);
     if(fullSession) await pool.query('INSERT INTO payment_logs (session_id,contact_id,location_id,appointment_id,amount,currency,status,access_token,payment_type) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (session_id) DO NOTHING',
       [fullSession.id,contactId,locationId,title,fullAmt,'jmd','pending',token,'full']);
   } catch(err){ console.error('[DB]',err.message); }
   var smsStatus = 'skipped_test_mode';
   if (config && config.mode === 'live') {
     try { await sendSms(token,locationId,contactId,smsMessage); smsStatus='sent'; } catch(err){ console.error('[SMS]',err.message); smsStatus='failed'; }
-  } else { console.log('[SMS] suppressed — mode is', (config&&config.mode)||'unknown'); }
+  } else { console.log('[SMS] suppressed â mode is', (config&&config.mode)||'unknown'); }
   res.json({ok:true,depositSessionId:depositSession.id,fullSessionId:fullSession?fullSession.id:null,smsStatus:smsStatus});
 });
 app.post('/api/webhooks/followup', async (req, res) => {
@@ -595,8 +594,7 @@ app.post('/api/webhooks/handypay', async (req, res) => {
   var sessionId = obj.id || obj.session_id || body.id;
   var amountReceived = obj.amount_total || obj.amount || obj.amount_received;
 
-  res.json({ ok: true });
-
+  // res.json deferred — sent after critical work completes
   try {
     // Primary: read from session metadata (works even if DB log is missing)
     var contactId   = (obj.metadata && obj.metadata.contactId)   || null;
@@ -657,6 +655,7 @@ app.post('/api/webhooks/handypay', async (req, res) => {
   } catch (err) {
     console.error('[hp webhook ERROR]', err.message);
   }
+  res.json({ ok: true });
 });
 
 // ============================================================
@@ -753,14 +752,13 @@ app.all(['/api/query', '/api/query/:paymentIntentId'], async (req, res) => {
             if (hpPayStatus === 'paid' || hpSession.status === 'complete') {
               // Update DB and return succeeded
               await updatePaymentLogStatus((log && log.session_id) ? log.session_id : paymentIntentId, 'paid');
-              return res.json({ status: 'succeeded', paymentIntentId: paymentIntentId });
-              // RECORD-PAYMENT: Call GHL API to mark invoice as paid
+                            // RECORD-PAYMENT: Call GHL API to mark invoice as paid
               try {
                 if (log && log.appointment_id && log.location_id) {
                   var rpCfg = cfg || (await getMerchantConfig(log.location_id).catch(function(){return null;}));
-                  if (rpCfg && rpCfg.ghl_access_token) {
-                    var rpTok = rpCfg.ghl_access_token;
-                    try { var rpRef = await refreshCrmToken(log.location_id); if (rpRef && rpRef.access_token) rpTok = rpRef.access_token; } catch(e3){}
+                  if (rpCfg && rpCfg.crm_access_token) {
+                    var rpTok = rpCfg.crm_access_token;
+                    try { var rpRef = await refreshCrmToken(log.location_id); if (rpRef) rpTok = rpRef; } catch(e3){}
                     fetch(GHL_API + '/invoices/' + log.appointment_id + '/record-payment', {
                       method: 'POST',
                       headers: { 'Authorization': 'Bearer ' + rpTok, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
@@ -768,7 +766,8 @@ app.all(['/api/query', '/api/query/:paymentIntentId'], async (req, res) => {
                     }).then(function(rp){ console.log('[query/record-payment]', log.appointment_id, rp.status); }).catch(function(e4){ console.error('[query/record-payment]', e4.message); });
                   }
                 }
-              } catch(rpErr) { console.error('[query/record-payment]:', rpErr.message); }            }
+              } catch(rpErr) { console.error('[query/record-payment]:', rpErr.message); }
+              return res.json({ status: 'succeeded', paymentIntentId: paymentIntentId });            }
           }
         }
       } catch (e) { console.error('[/api/query] HP check error:', e.message); }
@@ -934,7 +933,7 @@ app.get('/api/pay', async (req, res) => {
       + '</head><body><div class="card"><div class="logo">&#x1F4B3;</div><h2>HandyPay</h2><div class="amt" id="a"></div><div class="lbl" id="l">Loading payment details...</div><button class="btn" id="b" onclick="openHP()">Open HandyPay Checkout</button><div class="st" id="s"></div></div>'
       + '<script>var L="' + locationId + '",done=false,SID="",poll=null,AMT=0,DESC="Invoice Payment",INV="";'
       + 'function ss(t){document.getElementById("s").textContent=t;}'
-      + 'function jmd(raw,cur){var n=parseFloat(raw)||0;if(!n)return 0;cur=(cur||("")).toUpperCase();if(cur==="USD")return Math.round((n>=100?n/100:n)*155);return n;}'
+      + 'function jmd(raw,cur){var n=parseFloat(raw)||0;if(!n)return 0;cur=(cur||("")).toUpperCase();if(cur==="USD")return Math.round((n>=100?n/100:n)*155);if(cur==="JMD")return n>=10000?Math.round(n/100):n;return n;}'
       + 'function openHP(){if(done)return;document.getElementById("b").disabled=true;ss("Opening HandyPay...");'
       + 'fetch("/api/create-native-session",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({locationId:L,amountJMD:AMT,description:DESC,entityId:INV,ghlTransactionId:window._GHL_TXN||""})})'
       + '.then(function(r){return r.json();}).then(function(d){if(!d.checkoutUrl){ss("Error: "+(d.error||"?"));document.getElementById("b").disabled=false;return;}'
@@ -959,7 +958,7 @@ app.get('/api/pay', async (req, res) => {
 });
 
 // =================================================================
-// QUERY — POST (GHL backend server calls POST /api/query to verify payment)
+// QUERY â POST (GHL backend server calls POST /api/query to verify payment)
 // GHL sends: { chargeId, transactionId, apiKey, type: "verify" }
 // We must return: { status: "succeeded" } for paid sessions
 // =================================================================
@@ -981,7 +980,7 @@ app.post('/api/query', async function(req, res) {
       var r2 = await pool.query('SELECT * FROM payment_logs WHERE ghl_transaction_id = $1', [transactionId]);
       log = r2.rows[0] || null;
     }
-    // DB says paid — fast path: also ensure GHL invoice is marked paid
+    // DB says paid â fast path: also ensure GHL invoice is marked paid
     if (log && (log.status === 'paid' || log.status === 'completed')) {
       if (log.location_id) {
         var qTok = await getFreshToken(log.location_id);
