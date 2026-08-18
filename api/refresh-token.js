@@ -1,3 +1,6 @@
+// api/refresh-token.js — Token refresh + PIT mode support
+// PIT mode: if crm_refresh_token is NULL/empty, the stored token is a
+// GHL Private Integration Token (never expires) — return success immediately.
 const { Pool } = require('pg');
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
@@ -15,17 +18,31 @@ module.exports = async (req, res) => {
 
     // ---- MANUAL INJECTION MODE ----
     // If manual_token is provided, skip GHL refresh and store directly
+    // Pass manual_refresh= (empty) to switch location to PIT mode
     if (req.query.manual_token) {
-      const newRefresh = req.query.manual_refresh || rows[0].crm_refresh_token || '';
+      // If manual_refresh is explicitly passed (even empty), use it; otherwise keep existing
+      const hasManualRefresh = Object.prototype.hasOwnProperty.call(req.query, 'manual_refresh');
+      const newRefresh = hasManualRefresh ? (req.query.manual_refresh || null) : (rows[0].crm_refresh_token || null);
       await pool.query(
         'UPDATE merchant_configs SET crm_access_token=$1, crm_refresh_token=$2 WHERE location_id=$3',
         [req.query.manual_token, newRefresh, locationId]
       );
-      return res.json({ success: true, mode: 'manual_injection', message: 'Token manually stored in Neon. Run /api/cron-retry to process pending sessions.' });
+      const mode = newRefresh ? 'oauth_manual' : 'pit_manual';
+      return res.json({ success: true, mode, message: mode === 'pit_manual' ? 'Token stored as permanent PIT — no future refresh needed.' : 'Token manually stored. Will auto-refresh using stored refresh_token.' });
     }
 
-    // ---- AUTO REFRESH MODE ----
-    if (!rows[0].crm_refresh_token) return res.status(404).json({ error: 'no refresh token stored — re-run OAuth or use manual_token param' });
+    // ---- PIT MODE (permanent, never expires) ----
+    // If no refresh token stored, the access token is a GHL Private Integration Token.
+    // These never expire — return success without touching GHL.
+    if (!rows[0].crm_refresh_token) {
+      return res.json({
+        success: true,
+        mode: 'pit',
+        message: 'PIT mode — GHL Private Integration Token in use. No refresh needed. Token is permanent.'
+      });
+    }
+
+    // ---- AUTO REFRESH MODE (OAuth token rotation) ----
     const refreshToken = rows[0].crm_refresh_token;
 
     const params = new URLSearchParams();

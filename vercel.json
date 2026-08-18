@@ -16,6 +16,10 @@
     {
       "src": "api/refresh-token.js",
       "use": "@vercel/node"
+    },
+    {
+      "src": "api/ghl-setup.js",
+      "use": "@vercel/node"
     }
   ],
   "routes": [
@@ -30,6 +34,10 @@
     {
       "src": "/api/refresh-token",
       "dest": "api/refresh-token.js"
+    },
+    {
+      "src": "/api/ghl-setup",
+      "dest": "api/ghl-setup.js"
     },
     {
       "src": "/(.*)",

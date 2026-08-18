@@ -1,5 +1,6 @@
 // api/cron-retry.js — standalone Vercel serverless function
 // Retries GHL record-payment for sessions paid 3-60 min ago (bypasses 409 lock)
+// PIT mode: locations with no crm_refresh_token use a permanent GHL API key (no rotation)
 'use strict';
 const { Pool } = require('pg');
 
@@ -41,8 +42,18 @@ async function refreshCrmToken(locationId) {
 async function getFreshToken(locationId) {
   const cfg = await getMerchantConfig(locationId).catch(() => null);
   if (!cfg) return '';
-  let tok = cfg.crm_access_token || cfg.ghl_access_token || '';
-  try { const fresh = await refreshCrmToken(locationId); if (fresh) tok = fresh; } catch (e) {}
+  const tok = cfg.crm_access_token || cfg.ghl_access_token || '';
+  // PIT mode: no refresh token stored = GHL Private Integration Token (never expires)
+  // Skip the OAuth refresh attempt entirely — just return the stored permanent token
+  const refreshTok = cfg.crm_refresh_token || cfg.ghl_refresh_token || '';
+  if (!refreshTok) {
+    console.log('[cron] PIT mode for', locationId, '— using permanent token');
+    return tok;
+  }
+  // OAuth mode: try to refresh, fall back to stored token
+  try { const fresh = await refreshCrmToken(locationId); if (fresh) return fresh; } catch (e) {
+    console.log('[cron] token refresh skipped:', e.message, '— using stored token');
+  }
   return tok;
 }
 
@@ -121,4 +132,4 @@ module.exports = async function handler(req, res) {
     console.error('[cron] error:', err.message);
     return res.status(500).json({ error: err.message });
   }
-};
+}
