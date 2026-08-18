@@ -8,6 +8,14 @@
     {
       "src": "api/cron-retry.js",
       "use": "@vercel/node"
+    },
+    {
+      "src": "api/fix-db.js",
+      "use": "@vercel/node"
+    },
+    {
+      "src": "api/refresh-token.js",
+      "use": "@vercel/node"
     }
   ],
   "routes": [
@@ -16,14 +24,16 @@
       "dest": "api/cron-retry.js"
     },
     {
+      "src": "/api/fix-db",
+      "dest": "api/fix-db.js"
+    },
+    {
+      "src": "/api/refresh-token",
+      "dest": "api/refresh-token.js"
+    },
+    {
       "src": "/(.*)",
       "dest": "server.js"
-    }
-  ],
-  "crons": [
-    {
-      "path": "/api/cron-retry?secret=handypay-init-2026-lnet",
-      "schedule": "*/5 * * * *"
     }
   ]
 }
