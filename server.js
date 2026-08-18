@@ -493,8 +493,10 @@ app.post('/api/webhooks/crm', async (req, res) => {
     if(fullSession) await pool.query('INSERT INTO payment_logs (session_id,contact_id,location_id,appointment_id,amount,currency,status,access_token,payment_type) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (session_id) DO NOTHING',
       [fullSession.id,contactId,locationId,title,fullAmt,'jmd','pending',token,'full']);
   } catch(err){ console.error('[DB]',err.message); }
-  var smsStatus = 'failed';
-  try { await sendSms(token,locationId,contactId,smsMessage); smsStatus='sent'; } catch(err){ console.error('[SMS]',err.message); }
+  var smsStatus = 'skipped_test_mode';
+  if (config && config.mode === 'live') {
+    try { await sendSms(token,locationId,contactId,smsMessage); smsStatus='sent'; } catch(err){ console.error('[SMS]',err.message); smsStatus='failed'; }
+  } else { console.log('[SMS] suppressed — mode is', (config&&config.mode)||'unknown'); }
   res.json({ok:true,depositSessionId:depositSession.id,fullSessionId:fullSession?fullSession.id:null,smsStatus:smsStatus});
 });
 app.post('/api/webhooks/followup', async (req, res) => {
