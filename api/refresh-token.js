@@ -9,14 +9,25 @@ module.exports = async (req, res) => {
   if (!locationId) return res.status(400).json({ error: 'locationId required' });
 
   try {
-    // Get stored refresh token
+    // Get stored tokens
     const { rows } = await pool.query('SELECT crm_refresh_token, crm_access_token FROM merchant_configs WHERE location_id=$1', [locationId]);
     if (!rows[0]) return res.status(404).json({ error: 'no merchant config found for this location' });
-    if (!rows[0].crm_refresh_token) return res.status(404).json({ error: 'no refresh token stored — re-run OAuth' });
 
+    // ---- MANUAL INJECTION MODE ----
+    // If manual_token is provided, skip GHL refresh and store directly
+    if (req.query.manual_token) {
+      const newRefresh = req.query.manual_refresh || rows[0].crm_refresh_token || '';
+      await pool.query(
+        'UPDATE merchant_configs SET crm_access_token=$1, crm_refresh_token=$2 WHERE location_id=$3',
+        [req.query.manual_token, newRefresh, locationId]
+      );
+      return res.json({ success: true, mode: 'manual_injection', message: 'Token manually stored in Neon. Run /api/cron-retry to process pending sessions.' });
+    }
+
+    // ---- AUTO REFRESH MODE ----
+    if (!rows[0].crm_refresh_token) return res.status(404).json({ error: 'no refresh token stored — re-run OAuth or use manual_token param' });
     const refreshToken = rows[0].crm_refresh_token;
 
-    // Call GHL token refresh endpoint
     const params = new URLSearchParams();
     params.append('grant_type', 'refresh_token');
     params.append('client_id', process.env.GHL_CLIENT_ID);
@@ -36,13 +47,12 @@ module.exports = async (req, res) => {
       return res.json({ success: false, status: tokenRes.status, error: 'GHL token refresh failed', details: tokenData });
     }
 
-    // Update merchant_configs with fresh tokens
     await pool.query(
       'UPDATE merchant_configs SET crm_access_token=$1, crm_refresh_token=$2 WHERE location_id=$3',
       [tokenData.access_token, tokenData.refresh_token || refreshToken, locationId]
     );
 
-    return res.json({ success: true, message: 'Token refreshed and saved to DB', expires_in: tokenData.expires_in });
+    return res.json({ success: true, mode: 'auto_refresh', message: 'Token refreshed and saved to DB', expires_in: tokenData.expires_in });
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }
