@@ -1,6 +1,6 @@
 // api/cron-retry.js — standalone Vercel serverless function
 // Retries GHL record-payment for sessions paid 3-60 min ago (bypasses 409 lock)
-// PIT mode: locations with no crm_refresh_token use a permanent GHL API key (no rotation)
+// PIT mode: locations with NULL crm_refresh_token use a permanent GHL API key
 'use strict';
 const { Pool } = require('pg');
 
@@ -18,7 +18,7 @@ async function getMerchantConfig(locationId) {
 
 async function refreshCrmToken(locationId) {
   const cfg = await getMerchantConfig(locationId);
-  const refreshTok = (cfg && cfg.crm_refresh_token) || (cfg && cfg.ghl_refresh_token) || '';
+  const refreshTok = (cfg && cfg.crm_refresh_token) || '';
   if (!cfg || !refreshTok) throw new Error('No refresh token for ' + locationId);
   const r = await fetch(GHL_API + '/oauth/token', {
     method: 'POST',
@@ -32,9 +32,11 @@ async function refreshCrmToken(locationId) {
   });
   if (!r.ok) throw new Error('Token refresh failed: ' + r.status);
   const data = await r.json();
+  if (!data.access_token) throw new Error('No access_token in refresh response');
+  // Only update columns that exist in the schema
   await pool.query(
-    'UPDATE merchant_configs SET crm_access_token=$1, crm_refresh_token=$2, ghl_access_token=$1, ghl_refresh_token=$2, updated_at=NOW() WHERE location_id=$3',
-    [data.access_token, data.refresh_token, locationId]
+    'UPDATE merchant_configs SET crm_access_token=$1, crm_refresh_token=$2, updated_at=NOW() WHERE location_id=$3',
+    [data.access_token, data.refresh_token || refreshTok, locationId]
   );
   return data.access_token;
 }
@@ -42,16 +44,18 @@ async function refreshCrmToken(locationId) {
 async function getFreshToken(locationId) {
   const cfg = await getMerchantConfig(locationId).catch(() => null);
   if (!cfg) return '';
-  const tok = cfg.crm_access_token || cfg.ghl_access_token || '';
-  // PIT mode: no refresh token stored = GHL Private Integration Token (never expires)
-  // Skip the OAuth refresh attempt entirely — just return the stored permanent token
-  const refreshTok = cfg.crm_refresh_token || cfg.ghl_refresh_token || '';
+  const tok = cfg.crm_access_token || '';
+  // PIT mode: no refresh token = permanent GHL Private Integration Token, never expires
+  const refreshTok = cfg.crm_refresh_token || '';
   if (!refreshTok) {
     console.log('[cron] PIT mode for', locationId, '— using permanent token');
     return tok;
   }
-  // OAuth mode: try to refresh, fall back to stored token
-  try { const fresh = await refreshCrmToken(locationId); if (fresh) return fresh; } catch (e) {
+  // OAuth mode: try to refresh, fall back to stored token on any error
+  try {
+    const fresh = await refreshCrmToken(locationId);
+    if (fresh) return fresh;
+  } catch (e) {
     console.log('[cron] token refresh skipped:', e.message, '— using stored token');
   }
   return tok;
@@ -120,11 +124,7 @@ module.exports = async function handler(req, res) {
           results.push({ session: row.session_id, status: 'failed', code: rpStatus, invoiceId: invId });
         }
       } else {
-        results.push({
-          session: row.session_id,
-          status: 'skipped',
-          reason: !invId ? 'no-invoiceId' : 'no-token'
-        });
+        results.push({ session: row.session_id, status: 'skipped', reason: !invId ? 'no-invoiceId' : 'no-token' });
       }
     }
     return res.json({ ran_at: new Date().toISOString(), processed: rows.length, results });
@@ -132,4 +132,4 @@ module.exports = async function handler(req, res) {
     console.error('[cron] error:', err.message);
     return res.status(500).json({ error: err.message });
   }
-}
+};
