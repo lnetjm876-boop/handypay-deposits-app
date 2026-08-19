@@ -1,47 +1,20 @@
 {
   "version": 2,
   "builds": [
-    {
-      "src": "server.js",
-      "use": "@vercel/node"
-    },
-    {
-      "src": "api/cron-retry.js",
-      "use": "@vercel/node"
-    },
-    {
-      "src": "api/fix-db.js",
-      "use": "@vercel/node"
-    },
-    {
-      "src": "api/refresh-token.js",
-      "use": "@vercel/node"
-    },
-    {
-      "src": "api/ghl-setup.js",
-      "use": "@vercel/node"
-    }
+    { "src": "server.js",            "use": "@vercel/node" },
+    { "src": "api/cron-retry.js",    "use": "@vercel/node" },
+    { "src": "api/fix-db.js",        "use": "@vercel/node" },
+    { "src": "api/refresh-token.js", "use": "@vercel/node" },
+    { "src": "api/ghl-setup.js",     "use": "@vercel/node" },
+    { "src": "api/query.js",         "use": "@vercel/node" }
   ],
   "routes": [
-    {
-      "src": "/api/cron-retry",
-      "dest": "api/cron-retry.js"
-    },
-    {
-      "src": "/api/fix-db",
-      "dest": "api/fix-db.js"
-    },
-    {
-      "src": "/api/refresh-token",
-      "dest": "api/refresh-token.js"
-    },
-    {
-      "src": "/api/ghl-setup",
-      "dest": "api/ghl-setup.js"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "server.js"
-    }
+    { "src": "/api/cron-retry",        "dest": "api/cron-retry.js" },
+    { "src": "/api/fix-db",            "dest": "api/fix-db.js" },
+    { "src": "/api/refresh-token",     "dest": "api/refresh-token.js" },
+    { "src": "/api/ghl-setup",         "dest": "api/ghl-setup.js" },
+    { "src": "/api/query/([^/]+)",     "dest": "api/query.js?paymentIntentId=$1" },
+    { "src": "/api/query",             "dest": "api/query.js" },
+    { "src": "/(.*)",                  "dest": "server.js" }
   ]
 }
