@@ -57,6 +57,9 @@ app.get('/success', async (req, res) => {
           if (!sInvId && sLog.ghl_transaction_id) { sInvId = await getInvoiceIdByTx(sLog.location_id, sLog.ghl_transaction_id, sTok2); console.log('[/success] tx->inv:', sLog.ghl_transaction_id, '->', sInvId); }
           if (sInvId) { fireRecordPayment(sInvId, sLog.location_id, sLog.amount, 'HandyPay:' + sessionId, sTok2); }
           else { console.log('[/success] no invoiceId for session', sessionId); }
+          // Send payment.captured webhook to GHL (backup confirmation path)
+          var sCfg2 = await getMerchantConfig(sLog.location_id).catch(function(){return null;});
+          if (sCfg2) { sendGHLPaymentCapturedWebhook(sCfg2, sessionId, sLog.ghl_transaction_id, sLog.amount).catch(function(){}); }
           // Redundant tag+note: fires on success page regardless of HP webhook delivery
           if (sLog.contact_id && sLog.payment_type !== 'ghl_native') {
             await addContactTag(sTok2, sLog.contact_id, ['deposit-paid']).catch(function(e){ console.error('[/success] tag err:', e.message); });
@@ -272,6 +275,31 @@ async function createHandyPaySession(apiKey, amountJMD, label, meta, passFeesToC
   if (!r.ok) throw new Error('HandyPay ' + r.status + ': ' + text);
   var parsed = JSON.parse(text);
   return parsed.data || parsed;
+}
+
+async function sendGHLPaymentCapturedWebhook(cfg, chargeId, ghlTransactionId, amountJMD) {
+  try {
+    var payload = {
+      event: 'payment.captured',
+      chargeId: chargeId || '',
+      ghlTransactionId: ghlTransactionId || '',
+      chargeSnapshot: {
+        status: 'succeeded',
+        amount: Math.round((parseFloat(amountJMD) || 0) * 100),
+        chargeId: chargeId || '',
+        chargedAt: Math.floor(Date.now() / 1000)
+      },
+      locationId: cfg.location_id || '',
+      apiKey: cfg.handypay_api_key || '',
+      marketplaceAppId: GHL_CLIENT_ID || ''
+    };
+    var r = await fetch('https://backend.leadconnectorhq.com/payments/custom-provider/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Version': '2021-07-28' },
+      body: JSON.stringify(payload)
+    });
+    console.log('[GHL-webhook] payment.captured sent:', r.status, cfg.location_id, chargeId);
+  } catch(e) { console.error('[GHL-webhook] failed:', e.message); }
 }
 
 // PAYMENT PROVIDER REGISTRATION
@@ -511,7 +539,7 @@ app.post('/api/webhooks/crm', async (req, res) => {
   var smsStatus = 'skipped_test_mode';
   if (config && config.mode === 'live') {
     try { await sendSms(token,locationId,contactId,smsMessage); smsStatus='sent'; } catch(err){ console.error('[SMS]',err.message); smsStatus='failed'; }
-  } else { console.log('[SMS] suppressed ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ mode is', (config&&config.mode)||'unknown'); }
+  } else { console.log('[SMS] suppressed ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ mode is', (config&&config.mode)||'unknown'); }
   res.json({ok:true,depositSessionId:depositSession.id,fullSessionId:fullSession?fullSession.id:null,smsStatus:smsStatus});
 });
 app.post('/api/webhooks/followup', async (req, res) => {
@@ -610,7 +638,7 @@ app.post('/api/webhooks/handypay', async (req, res) => {
   var sessionId = obj.id || obj.session_id || body.id;
   var amountReceived = obj.amount_total || obj.amount || obj.amount_received;
 
-  // res.json deferred ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ sent after critical work completes
+  // res.json deferred ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ sent after critical work completes
   try {
     // Primary: read from session metadata (works even if DB log is missing)
     var contactId   = (obj.metadata && obj.metadata.contactId)   || null;
@@ -952,14 +980,14 @@ app.get('/api/pay', async (req, res) => {
       + 'function jmd(raw,cur){var n=parseFloat(raw)||0;if(!n)return 0;cur=(cur||("")).toUpperCase();if(cur==="USD")return Math.round((n>=100?n/100:n)*155);if(cur==="JMD")return n>=10000?Math.round(n/100):n;return n;}'
       + 'function openHP(){if(done)return;document.getElementById("b").disabled=true;ss("Opening HandyPay...");'
       + 'fetch("/api/create-native-session",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({locationId:L,amountJMD:AMT,description:DESC,entityId:INV,ghlTransactionId:window._GHL_TXN||""})})'
-      + '.then(function(r){return r.json();}).then(function(d){if(!d.checkoutUrl){ss("Error: "+(d.error||"?"));document.getElementById("b").disabled=false;return;}'
+      + '.then(function(r){return r.json();}).then(function(d){if(!d.checkoutUrl){ss("Error: "+(d.error||"?"));window.parent.postMessage(JSON.stringify({type:"custom_element_error_response",error:{description:d.error||"Payment session creation failed"}}),"*");document.getElementById("b").disabled=false;return;}'
       + 'SID=d.sessionId||d.paymentIntentId||"";var w=window.open(d.checkoutUrl,"_blank");if(!w){ss("Popup blocked");document.getElementById("b").disabled=false;done=false;return;}'
       + 'done=true;ss("\u23F3 HandyPay open in new tab. Return here after paying.");'
       + 'poll=setInterval(function(){if(!SID)return;fetch("/api/query?paymentIntentId="+SID).then(function(r){return r.json();}).then(function(qd){'
       + 'if(qd.status==="succeeded"){clearInterval(poll);ss("\u2705 Payment confirmed!");'
       + 'window.parent.postMessage(JSON.stringify({type:"custom_element_success_response",chargeId:(window._GHL_TXN||SID)}),"*");'
       + 'setTimeout(function(){window.parent.postMessage(JSON.stringify({type:"custom_element_close_response"}),"*");},1500);}}).catch(function(){});},3000);'
-      + '}).catch(function(e){ss("Error: "+e.message);document.getElementById("b").disabled=false;done=false;});}'
+      + '}).catch(function(e){ss("Error: "+e.message);window.parent.postMessage(JSON.stringify({type:"custom_element_error_response",error:{description:e.message||"Payment error"}}),"*");document.getElementById("b").disabled=false;done=false;});}'
       + 'window.addEventListener("message",function(e){var data;try{data=JSON.parse(e.data);}catch(x){return;}'
       + 'if(data&&data.type==="PAYMENT_SUCCESS"&&!done){done=true;clearInterval(poll);ss(\"\u2705 Payment confirmed!\");window.parent.postMessage(JSON.stringify({type:\"custom_element_success_response\",chargeId:(window._GHL_TXN||SID||data.paymentIntentId||\"\")}),"*");setTimeout(function(){window.parent.postMessage(JSON.stringify({type:\"custom_element_close_response\"}),"*");},1500);return;}if(data.type==="payment_initiate_props"){AMT=jmd(data.amount,data.currency);DESC=data.description||data.name||"Invoice Payment";INV=data.entityId||data.invoiceId||data.orderId||"";window._GHL_TXN=data.transactionId||data.invoiceId||"";'
       + 'document.getElementById("a").textContent="J$"+AMT.toLocaleString();document.getElementById("a").style.display="block";document.getElementById("l").textContent="Invoice Payment";document.getElementById("b").style.display="block";setTimeout(openHP,500);}});'
@@ -974,7 +1002,7 @@ app.get('/api/pay', async (req, res) => {
 });
 
 // =================================================================
-// QUERY ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ POST (GHL backend server calls POST /api/query to verify payment)
+// QUERY ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ POST (GHL backend server calls POST /api/query to verify payment)
 // GHL sends: { chargeId, transactionId, apiKey, type: "verify" }
 // We must return: { status: "succeeded" } for paid sessions
 // =================================================================
@@ -985,6 +1013,18 @@ app.post('/api/query', async function(req, res) {
   await pool.query('INSERT INTO debug_messages (location_id, message, origin) VALUES ($1, $2, $3)',
     ['post-query', JSON.stringify({ chargeId: chargeId, txn: transactionId, type: req.body.type }), 'post-query-handler']
   ).catch(function(){});
+  // Handle refund requests from GHL
+  if (req.body.type === 'refund') {
+    var refAmount = parseFloat(req.body.amount) || 0;
+    var refChargeId = req.body.chargeId || '';
+    var refTxId = req.body.transactionId || '';
+    console.log('[query:refund] chargeId:', refChargeId, 'txId:', refTxId, 'amount:', refAmount);
+    // Log refund for manual processing via HandyPay dashboard
+    pool.query('INSERT INTO debug_messages (location_id, message, origin) VALUES ($1, $2, $3)',
+      ['refund', JSON.stringify({ chargeId: refChargeId, txId: refTxId, amount: refAmount }), 'refund-handler']
+    ).catch(function(){});
+    return res.json({ success: true, message: 'Refund logged - process via HandyPay dashboard', id: 'ref_' + Date.now(), amount: refAmount, currency: 'JMD' });
+  }
   if (!chargeId && !transactionId) return res.json({ status: 'pending' });
   try {
     var log = null;
@@ -996,7 +1036,7 @@ app.post('/api/query', async function(req, res) {
       var r2 = await pool.query('SELECT * FROM payment_logs WHERE ghl_transaction_id = $1', [transactionId]);
       log = r2.rows[0] || null;
     }
-    // DB says paid ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ fast path: also ensure GHL invoice is marked paid
+    // DB says paid ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ fast path: also ensure GHL invoice is marked paid
     if (log && (log.status === 'paid' || log.status === 'completed')) {
       if (log.location_id) {
         var qTok = await getFreshToken(log.location_id);
