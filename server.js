@@ -57,6 +57,11 @@ app.get('/success', async (req, res) => {
           if (!sInvId && sLog.ghl_transaction_id) { sInvId = await getInvoiceIdByTx(sLog.location_id, sLog.ghl_transaction_id, sTok2); console.log('[/success] tx->inv:', sLog.ghl_transaction_id, '->', sInvId); }
           if (sInvId) { fireRecordPayment(sInvId, sLog.location_id, sLog.amount, 'HandyPay:' + sessionId, sTok2); }
           else { console.log('[/success] no invoiceId for session', sessionId); }
+          // Redundant tag+note: fires on success page regardless of HP webhook delivery
+          if (sLog.contact_id && sLog.payment_type !== 'ghl_native') {
+            addContactTag(sLog.contact_id, ['deposit-paid'], sTok2).catch(function(e){ console.error('[/success] tag err:', e.message); });
+            addContactNote(sLog.contact_id, (sLog.payment_type||'deposit') + ' paid via HandyPay: ' + sLog.amount + ' JMD', sTok2).catch(function(e){ console.error('[/success] note err:', e.message); });
+          }
         }
       }
     } catch(sErr) { console.error('[/success] err:', sErr.message); }
@@ -506,7 +511,7 @@ app.post('/api/webhooks/crm', async (req, res) => {
   var smsStatus = 'skipped_test_mode';
   if (config && config.mode === 'live') {
     try { await sendSms(token,locationId,contactId,smsMessage); smsStatus='sent'; } catch(err){ console.error('[SMS]',err.message); smsStatus='failed'; }
-  } else { console.log('[SMS] suppressed ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ mode is', (config&&config.mode)||'unknown'); }
+  } else { console.log('[SMS] suppressed ÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ mode is', (config&&config.mode)||'unknown'); }
   res.json({ok:true,depositSessionId:depositSession.id,fullSessionId:fullSession?fullSession.id:null,smsStatus:smsStatus});
 });
 app.post('/api/webhooks/followup', async (req, res) => {
@@ -605,7 +610,7 @@ app.post('/api/webhooks/handypay', async (req, res) => {
   var sessionId = obj.id || obj.session_id || body.id;
   var amountReceived = obj.amount_total || obj.amount || obj.amount_received;
 
-  // res.json deferred ÃÂ¢ÃÂÃÂ sent after critical work completes
+  // res.json deferred ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ sent after critical work completes
   try {
     // Primary: read from session metadata (works even if DB log is missing)
     var contactId   = (obj.metadata && obj.metadata.contactId)   || null;
@@ -969,7 +974,7 @@ app.get('/api/pay', async (req, res) => {
 });
 
 // =================================================================
-// QUERY ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ POST (GHL backend server calls POST /api/query to verify payment)
+// QUERY ÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ POST (GHL backend server calls POST /api/query to verify payment)
 // GHL sends: { chargeId, transactionId, apiKey, type: "verify" }
 // We must return: { status: "succeeded" } for paid sessions
 // =================================================================
@@ -991,7 +996,7 @@ app.post('/api/query', async function(req, res) {
       var r2 = await pool.query('SELECT * FROM payment_logs WHERE ghl_transaction_id = $1', [transactionId]);
       log = r2.rows[0] || null;
     }
-    // DB says paid ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ fast path: also ensure GHL invoice is marked paid
+    // DB says paid ÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ fast path: also ensure GHL invoice is marked paid
     if (log && (log.status === 'paid' || log.status === 'completed')) {
       if (log.location_id) {
         var qTok = await getFreshToken(log.location_id);
