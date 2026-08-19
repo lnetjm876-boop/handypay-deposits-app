@@ -15,6 +15,21 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+// Parse request body (Vercel does NOT auto-parse JSON for serverless functions)
+async function parseBody(req) {
+  // Already parsed as object (e.g. via Express or test harness)
+  if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) return req.body;
+  // String or Buffer — parse directly
+  if (req.body) { try { return JSON.parse(req.body.toString()); } catch (e) { return {}; } }
+  // Unread stream — read and parse
+  return new Promise(function(resolve) {
+    let raw = '';
+    req.on('data', function(c) { raw += c; });
+    req.on('end', function() { try { resolve(JSON.parse(raw)); } catch (e) { resolve({}); } });
+    req.on('error', function() { resolve({}); });
+  });
+}
+
 // DB helpers
 async function getMerchantConfig(locationId) {
   const { rows } = await pool.query('SELECT * FROM merchant_configs WHERE location_id=$1', [locationId]);
@@ -83,7 +98,7 @@ async function fireRecordPayment(invoiceId, locationId, amount, note, token) {
 
 // Main handler
 module.exports = async function handler(req, res) {
-  const body = req.body || {};
+  const body = await parseBody(req);
   const qType = body.type || req.query.type || '';
   const paymentIntentId =
     req.query.paymentIntentId ||
@@ -94,7 +109,7 @@ module.exports = async function handler(req, res) {
 
   console.log('[api/query]', req.method, 'type:', qType, 'id:', paymentIntentId);
 
-  // list_payment_methods — we don't store cards; return empty array
+  // list_payment_methods — we don't store cards on file; return empty array
   if (qType === 'list_payment_methods') {
     return res.json([]);
   }
@@ -113,12 +128,12 @@ module.exports = async function handler(req, res) {
     return res.json({ success: false, failed: true, message: 'Subscription billing is not yet supported by HandyPay Deposits. Coming in v2.' });
   }
 
-  // cancel_subscription — spec requires { status: "canceled" }
+  // cancel_subscription — spec §9.4.3 requires { status: "canceled" }
   if (qType === 'cancel_subscription') {
     return res.json({ status: 'canceled' });
   }
 
-  // refund — call HandyPay /refunds API
+  // refund — call HandyPay /refunds API, spec §10.1
   if (qType === 'refund') {
     const refChargeId = body.chargeId || paymentIntentId || '';
     const refAmount   = parseFloat(body.amount) || 0;
@@ -152,7 +167,7 @@ module.exports = async function handler(req, res) {
     return res.json({ success: true, message: 'Refund logged — process manually via HandyPay dashboard', id: 'ref_' + Date.now(), amount: refAmount, currency: 'JMD' });
   }
 
-  // verify (POST from GHL backend after iframe success event)
+  // verify — POST from GHL backend after iframe success event, spec §8.4
   if (qType === 'verify' || req.method === 'POST') {
     const chargeId      = body.chargeId || paymentIntentId || '';
     const transactionId = body.transactionId || '';
@@ -163,7 +178,6 @@ module.exports = async function handler(req, res) {
       if (!log && chargeId)      log = await getPaymentLogByTx(chargeId);
 
       if (log && (log.status === 'paid' || log.status === 'completed')) {
-        // Fire invoice record-payment in background
         if (log.location_id && !log.record_payment_done) {
           (async function() {
             try {
@@ -181,7 +195,6 @@ module.exports = async function handler(req, res) {
 
       if (log && log.status === 'failed') return res.json({ failed: true });
 
-      // Check HandyPay directly for pending sessions
       let hpKey = apiKey;
       if (!hpKey && log && log.location_id) {
         const hpCfg = await getMerchantConfig(log.location_id);
@@ -204,14 +217,14 @@ module.exports = async function handler(req, res) {
         } catch (hpE) { console.error('[api/query:verify] HP check error:', hpE.message); }
       }
 
-      return res.json({ success: false }); // pending — GHL leaves transaction pending
+      return res.json({ success: false });
     } catch (err) {
       console.error('[api/query:verify] ERROR:', err.message);
       return res.json({ success: false });
     }
   }
 
-  // GET status poll (from /api/pay iframe, polls every 3s)
+  // GET status poll (from /api/pay iframe, polls every 3s after HandyPay redirect)
   try {
     const pollId = req.query.paymentIntentId || paymentIntentId || '';
     if (!pollId) return res.json({ status: 'unknown' });
