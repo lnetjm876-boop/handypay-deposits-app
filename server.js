@@ -431,7 +431,7 @@ app.post('/api/webhooks/crm', async (req, res) => {
   try { body = typeof rawBody==='string' ? JSON.parse(rawBody) : (Buffer.isBuffer(rawBody) ? JSON.parse(rawBody.toString()) : rawBody); } catch(e) { body = rawBody; }
   console.log('[CRM Webhook]', JSON.stringify(body));
   var locationId = body.locationId||(body.customData&&body.customData.locationId);
-  var contactId  = body.contactId ||(body.customData&&body.customData.contactId);
+  var contactId  = body.contactId || body.contact_id ||(body.customData&&body.customData.contactId);
   var contactName= body.contactName||(body.customData&&body.customData.contactName)||'there';
   var startTime  = body.startTime  ||(body.customData&&body.customData.startTime);
   var title      = body.title      ||(body.customData&&body.customData.title)||'appointment';
@@ -495,7 +495,7 @@ app.post('/api/webhooks/crm', async (req, res) => {
   var smsStatus = 'skipped_test_mode';
   if (config && config.mode === 'live') {
     try { await sendSms(token,locationId,contactId,smsMessage); smsStatus='sent'; } catch(err){ console.error('[SMS]',err.message); smsStatus='failed'; }
-  } else { console.log('[SMS] suppressed â mode is', (config&&config.mode)||'unknown'); }
+  } else { console.log('[SMS] suppressed Ã¢ÂÂ mode is', (config&&config.mode)||'unknown'); }
   res.json({ok:true,depositSessionId:depositSession.id,fullSessionId:fullSession?fullSession.id:null,smsStatus:smsStatus});
 });
 app.post('/api/webhooks/followup', async (req, res) => {
@@ -594,7 +594,7 @@ app.post('/api/webhooks/handypay', async (req, res) => {
   var sessionId = obj.id || obj.session_id || body.id;
   var amountReceived = obj.amount_total || obj.amount || obj.amount_received;
 
-  // res.json deferred — sent after critical work completes
+  // res.json deferred â sent after critical work completes
   try {
     // Primary: read from session metadata (works even if DB log is missing)
     var contactId   = (obj.metadata && obj.metadata.contactId)   || null;
@@ -958,7 +958,7 @@ app.get('/api/pay', async (req, res) => {
 });
 
 // =================================================================
-// QUERY â POST (GHL backend server calls POST /api/query to verify payment)
+// QUERY Ã¢ÂÂ POST (GHL backend server calls POST /api/query to verify payment)
 // GHL sends: { chargeId, transactionId, apiKey, type: "verify" }
 // We must return: { status: "succeeded" } for paid sessions
 // =================================================================
@@ -980,7 +980,7 @@ app.post('/api/query', async function(req, res) {
       var r2 = await pool.query('SELECT * FROM payment_logs WHERE ghl_transaction_id = $1', [transactionId]);
       log = r2.rows[0] || null;
     }
-    // DB says paid â fast path: also ensure GHL invoice is marked paid
+    // DB says paid Ã¢ÂÂ fast path: also ensure GHL invoice is marked paid
     if (log && (log.status === 'paid' || log.status === 'completed')) {
       if (log.location_id) {
         var qTok = await getFreshToken(log.location_id);
