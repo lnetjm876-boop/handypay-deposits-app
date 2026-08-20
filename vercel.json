@@ -7,7 +7,8 @@
     { "src": "api/refresh-token.js", "use": "@vercel/node" },
     { "src": "api/ghl-setup.js",     "use": "@vercel/node" },
     { "src": "api/query.js",         "use": "@vercel/node" },
-    { "src": "api/success.js",       "use": "@vercel/node" }
+    { "src": "api/success.js",       "use": "@vercel/node" },
+    { "src": "api/pay.js",           "use": "@vercel/node" }
   ],
   "routes": [
     { "src": "/api/cron-retry",        "dest": "api/cron-retry.js" },
@@ -17,6 +18,7 @@
     { "src": "/api/query/([^/]+)",     "dest": "api/query.js?paymentIntentId=$1" },
     { "src": "/api/query",             "dest": "api/query.js" },
     { "src": "/success",               "dest": "api/success.js" },
+    { "src": "/api/pay",               "dest": "api/pay.js" },
     { "src": "/(.*)",                  "dest": "server.js" }
   ]
 }
