@@ -2,6 +2,7 @@
 // Handles: list_payment_methods, charge_payment, create_subscription,
 //          cancel_subscription, refund, verify, GET status poll
 // Routed by vercel.json BEFORE the server.js catch-all.
+// FIX: verify handler only fires record-payment for ghl_native sessions
 
 const { Pool } = require('pg');
 
@@ -17,11 +18,8 @@ const pool = new Pool({
 
 // Parse request body (Vercel does NOT auto-parse JSON for serverless functions)
 async function parseBody(req) {
-  // Already parsed as object (e.g. via Express or test harness)
   if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) return req.body;
-  // String or Buffer — parse directly
   if (req.body) { try { return JSON.parse(req.body.toString()); } catch (e) { return {}; } }
-  // Unread stream — read and parse
   return new Promise(function(resolve) {
     let raw = '';
     req.on('data', function(c) { raw += c; });
@@ -69,6 +67,7 @@ async function getFreshToken(locationId) {
   const cfg = await getMerchantConfig(locationId).catch(function() { return null; });
   if (!cfg) return '';
   let tok = cfg.crm_access_token || cfg.ghl_access_token || '';
+  if (!cfg.crm_refresh_token && !cfg.ghl_refresh_token) return tok; // PIT mode
   try { const fresh = await refreshCrmToken(locationId); if (fresh) tok = fresh; } catch (e) {}
   return tok;
 }
@@ -109,7 +108,7 @@ module.exports = async function handler(req, res) {
 
   console.log('[api/query]', req.method, 'type:', qType, 'id:', paymentIntentId);
 
-  // list_payment_methods — we don't store cards on file; return empty array
+  // list_payment_methods
   if (qType === 'list_payment_methods') {
     return res.json([]);
   }
@@ -128,12 +127,12 @@ module.exports = async function handler(req, res) {
     return res.json({ success: false, failed: true, message: 'Subscription billing is not yet supported by HandyPay Deposits. Coming in v2.' });
   }
 
-  // cancel_subscription — spec §9.4.3 requires { status: "canceled" }
+  // cancel_subscription
   if (qType === 'cancel_subscription') {
     return res.json({ status: 'canceled' });
   }
 
-  // refund — call HandyPay /refunds API, spec §10.1
+  // refund
   if (qType === 'refund') {
     const refChargeId = body.chargeId || paymentIntentId || '';
     const refAmount   = parseFloat(body.amount) || 0;
@@ -167,7 +166,7 @@ module.exports = async function handler(req, res) {
     return res.json({ success: true, message: 'Refund logged — process manually via HandyPay dashboard', id: 'ref_' + Date.now(), amount: refAmount, currency: 'JMD' });
   }
 
-  // verify — POST from GHL backend after iframe success event, spec §8.4
+  // verify — POST from GHL backend after iframe success event
   if (qType === 'verify' || req.method === 'POST') {
     const chargeId      = body.chargeId || paymentIntentId || '';
     const transactionId = body.transactionId || '';
@@ -178,12 +177,14 @@ module.exports = async function handler(req, res) {
       if (!log && chargeId)      log = await getPaymentLogByTx(chargeId);
 
       if (log && (log.status === 'paid' || log.status === 'completed')) {
-        if (log.location_id && !log.record_payment_done) {
+        // FIX: only fire record-payment for ghl_native sessions
+        // deposit/full sessions use tag+note — they have no GHL invoice to mark
+        if (log.location_id && !log.record_payment_done && log.payment_type === 'ghl_native') {
           (async function() {
             try {
               const qTok = await getFreshToken(log.location_id);
               if (!qTok) return;
-              let invId = log.entity_id || log.appointment_id || '';
+              let invId = log.entity_id || '';
               if (!invId && log.ghl_transaction_id) invId = await getInvoiceIdByTx(log.location_id, log.ghl_transaction_id, qTok);
               if (invId) await fireRecordPayment(invId, log.location_id, log.amount, 'HandyPay:verify:' + chargeId, qTok);
               await pool.query('UPDATE payment_logs SET record_payment_done=TRUE,updated_at=NOW() WHERE session_id=$1', [log.session_id]).catch(function() {});

@@ -1,5 +1,6 @@
 // api/cron-retry.js — standalone Vercel serverless function
-// Retries GHL record-payment for sessions paid 3-60 min ago (bypasses 409 lock)
+// Retries GHL record-payment for ghl_native sessions paid 3-60 min ago
+// FIX: only processes payment_type='ghl_native' — deposits use tag+note, not record-payment
 // PIT mode: locations with NULL crm_refresh_token use a permanent GHL API key
 'use strict';
 const { Pool } = require('pg');
@@ -33,7 +34,6 @@ async function refreshCrmToken(locationId) {
   if (!r.ok) throw new Error('Token refresh failed: ' + r.status);
   const data = await r.json();
   if (!data.access_token) throw new Error('No access_token in refresh response');
-  // Only update columns that exist in the schema
   await pool.query(
     'UPDATE merchant_configs SET crm_access_token=$1, crm_refresh_token=$2, updated_at=NOW() WHERE location_id=$3',
     [data.access_token, data.refresh_token || refreshTok, locationId]
@@ -45,13 +45,11 @@ async function getFreshToken(locationId) {
   const cfg = await getMerchantConfig(locationId).catch(() => null);
   if (!cfg) return '';
   const tok = cfg.crm_access_token || '';
-  // PIT mode: no refresh token = permanent GHL Private Integration Token, never expires
   const refreshTok = cfg.crm_refresh_token || '';
   if (!refreshTok) {
     console.log('[cron] PIT mode for', locationId, '— using permanent token');
     return tok;
   }
-  // OAuth mode: try to refresh, fall back to stored token on any error
   try {
     const fresh = await refreshCrmToken(locationId);
     if (fresh) return fresh;
@@ -98,15 +96,19 @@ module.exports = async function handler(req, res) {
   const sec = (req.query || {}).secret;
   if (sec !== process.env.INIT_SECRET) return res.status(401).json({ error: 'unauthorized' });
   try {
+    // FIX: only retry ghl_native sessions — deposit/full sessions don't have GHL invoices
+    // FIX: skip sessions where record_payment_done is already TRUE
     const { rows } = await pool.query(
       "SELECT * FROM payment_logs WHERE status='paid'" +
+      " AND payment_type = 'ghl_native'" +
+      " AND (record_payment_done IS NULL OR record_payment_done = FALSE)" +
       " AND created_at < NOW() - INTERVAL '3 minutes'" +
       " AND created_at > NOW() - INTERVAL '60 minutes'" +
       " AND location_id IS NOT NULL LIMIT 10"
     );
     const results = [];
     for (const row of rows) {
-      let invId = row.entity_id || row.appointment_id || '';
+      let invId = row.entity_id || '';
       const tok = await getFreshToken(row.location_id).catch(() => '');
       if (!invId && row.ghl_transaction_id && tok) {
         invId = await getInvoiceIdByTx(row.location_id, row.ghl_transaction_id, tok);
@@ -116,8 +118,13 @@ module.exports = async function handler(req, res) {
           invId, row.location_id, row.amount,
           'HandyPay-cron:' + row.session_id, tok
         );
-        if (rpStatus === 201 || rpStatus === 200) {
-          results.push({ session: row.session_id, status: 'done', invoiceId: invId });
+        if (rpStatus === 201 || rpStatus === 200 || rpStatus === 400) {
+          // 400 = already paid — treat as done
+          await pool.query(
+            'UPDATE payment_logs SET record_payment_done=TRUE, updated_at=NOW() WHERE session_id=$1',
+            [row.session_id]
+          ).catch(() => {});
+          results.push({ session: row.session_id, status: 'done', invoiceId: invId, code: rpStatus });
         } else if (rpStatus === 409) {
           results.push({ session: row.session_id, status: 'still_locked', invoiceId: invId });
         } else {
