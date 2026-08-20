@@ -1,12 +1,11 @@
 // api/pay.js — GHL Custom Payment Provider iframe
 //
-// ROOT CAUSE: GHL calendar booking never sends payment_initiate_props postMessage.
-// FIX: Server-side fetch of pending GHL order BEFORE rendering the HTML.
-//   1. On GET /api/pay?locationId=XXX, pull the most-recent pending calendar order
-//      from GHL's orders API using the stored crm_access_token.
-//   2. Embed amount + orderId directly in the page JS (no postMessage needed).
-//   3. Page auto-triggers HandyPay checkout after 1 second.
-//   4. Still listens for payment_initiate_props as fallback (covers invoice flow).
+// ROOT CAUSE: GHL calendar never sends payment_initiate_props postMessage.
+// FIX: Server-side fetch of pending GHL order BEFORE building the HTML.
+//   Step 1: GET /payments/orders (auth) → most-recent calendar order → orderId
+//   Step 2: GET /payments/orders/public/{orderId} (no auth) → deposit amount
+//   Embed amount + orderId in page JS. Client auto-triggers checkout after 1s.
+//   Still listens for payment_initiate_props as fallback for invoice surfaces.
 'use strict';
 
 const { Pool } = require('pg');
@@ -19,7 +18,7 @@ module.exports = async function handler(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'GET only' });
 
   const q          = req.query || {};
-  const locationId = q.locationId  || '';
+  const locationId = q.locationId   || '';
   const urlAmount  = parseFloat(q.amount || q.amountJMD || '0') || 0;
   const urlCurrency= (q.currency || 'JMD').toUpperCase();
   const urlTxId    = q.paymentIntentId || q.transactionId || q.orderId || q.entityId || '';
@@ -28,68 +27,94 @@ module.exports = async function handler(req, res) {
   res.setHeader('X-Frame-Options', 'ALLOWALL');
   res.setHeader('Content-Type', 'text/html');
 
-  // ── Server-side: fetch the pending GHL order for this location ──────────────
+  // ── Server-side: fetch pending calendar order ────────────────────────────────────
   let srvOrderId = '', srvOrderAmt = 0, srvOrderCur = 'JMD', srvOrderDesc = '';
 
   if (locationId) {
     try {
+      // Step 1: get auth token from Neon
       const { rows } = await pool.query(
         'SELECT crm_access_token, ghl_access_token FROM merchant_configs WHERE location_id=$1 LIMIT 1',
         [locationId]
       );
       const cfg   = rows[0];
-      const token = cfg && (cfg.crm_access_token || cfg.ghl_access_token);
+      const token = cfg && (cfg.crm_access_token || cfg.ghl_access_token) || '';
+      console.log('[pay] token found:', !!token, 'locationId:', locationId);
 
       if (token) {
+        // Step 2: list unpaid orders for this location
         const ctrl  = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 2500);
+        const timer = setTimeout(() => ctrl.abort(), 3000);
+        let orderId = '';
         try {
           const r = await fetch(
-            'https://services.leadconnectorhq.com/payments/orders?altId='
-              + encodeURIComponent(locationId)
+            'https://services.leadconnectorhq.com/payments/orders'
+              + '?altId=' + encodeURIComponent(locationId)
               + '&altType=location&paymentStatus=unpaid&limit=5',
             { headers: { Authorization: 'Bearer ' + token, Version: '2021-07-28' }, signal: ctrl.signal }
           );
           clearTimeout(timer);
+          console.log('[pay] orders list status:', r.status);
           if (r.ok) {
             const d      = await r.json();
-            const orders = (d.orders || d.data || []);
-            // Prefer calendar-source orders; fall back to first unpaid
-            const ord = orders.find(o => o.source && o.source.type === 'calendar') || orders[0];
+            // GHL returns { data: [...] } on orders list
+            const orders = d.data || d.orders || [];
+            console.log('[pay] orders count:', orders.length);
+            // Prefer calendar-source order; fall back to newest
+            const ord = orders.find(o => o.sourceType === 'calendar' || (o.source && o.source.type === 'calendar'))
+              || orders[0];
             if (ord) {
-              srvOrderId  = ord._id || '';
-              srvOrderAmt = (ord.paymentSummary && ord.paymentSummary.initialAmount > 0)
-                ? ord.paymentSummary.initialAmount
-                : (ord.amount || 0);
-              srvOrderCur  = ord.currency || 'JMD';
-              srvOrderDesc = (ord.source && ord.source.name) || 'Booking Deposit';
+              orderId = ord._id || '';
+              console.log('[pay] picked orderId:', orderId);
             }
-          } else {
-            console.error('[pay] orders API', r.status);
           }
         } catch (fe) {
           clearTimeout(timer);
-          console.error('[pay] order fetch:', fe.message);
+          console.error('[pay] orders list error:', fe.message);
+        }
+
+        // Step 3: fetch public order for deposit amount (no auth needed)
+        if (orderId) {
+          try {
+            const ctrl2  = new AbortController();
+            const timer2 = setTimeout(() => ctrl2.abort(), 2000);
+            const pr = await fetch(
+              'https://backend.leadconnectorhq.com/payments/orders/public/' + orderId,
+              { signal: ctrl2.signal }
+            );
+            clearTimeout(timer2);
+            if (pr.ok) {
+              const pd = await pr.json();
+              // initialAmount = deposit; amount = full price
+              srvOrderAmt  = (pd.paymentSummary && pd.paymentSummary.initialAmount > 0)
+                ? pd.paymentSummary.initialAmount
+                : (pd.amount || 0);
+              srvOrderCur  = pd.currency || 'JMD';
+              srvOrderDesc = (pd.source && pd.source.name) || 'Booking Deposit';
+              srvOrderId   = orderId;
+              console.log('[pay] deposit amt:', srvOrderAmt, srvOrderCur, 'desc:', srvOrderDesc);
+            }
+          } catch (pe) {
+            console.error('[pay] public order error:', pe.message);
+          }
         }
       }
     } catch (e) {
-      console.error('[pay] DB error:', e.message);
+      console.error('[pay] DB/fetch error:', e.message);
     }
   }
 
-  console.log('[pay] locationId:', locationId, 'srvAmt:', srvOrderAmt, 'orderId:', srvOrderId);
-
-  // Embed values for client JS
+  // Embed for client JS
   const L        = JSON.stringify(locationId);
   const URL_AMT  = JSON.stringify(urlAmount);
   const URL_CUR  = JSON.stringify(urlCurrency);
   const URL_TXN  = JSON.stringify(urlTxId);
-  const SRV_AMT  = JSON.stringify(srvOrderAmt);
+  const SRV_AMT  = JSON.stringify(srvOrderAmt);   // already in JMD whole units
   const SRV_CUR  = JSON.stringify(srvOrderCur);
   const SRV_DESC = JSON.stringify(srvOrderDesc);
   const SRV_ORD  = JSON.stringify(srvOrderId);
 
-  // ── Client JS (template literal — no string-concat bugs) ─────────────────────
+  // ── Client JS ────────────────────────────────────────────────────────────────────────────
   const clientJS = `
 var L=${L},URL_AMT=${URL_AMT},URL_CUR=${URL_CUR},URL_TXN=${URL_TXN};
 var SRV_AMT=${SRV_AMT},SRV_CUR=${SRV_CUR},SRV_DESC=${SRV_DESC},SRV_ORD=${SRV_ORD};
@@ -101,18 +126,21 @@ function ss(t){$el('s').textContent=t;}
 function dlog(s){
   dbgLines.push(s);
   $el('dbg').innerHTML=dbgLines.slice(-10).join('<br>');
-  try{fetch('/api/debug-log',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({label:'pay',data:s})}).catch(function(){});}catch(e){}
+  try{fetch('/api/debug-log',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:'pay',data:s})}).catch(function(){});}catch(e){}
 }
+// jmd: converts raw amount to JMD whole units
+// GHL list API returns whole JMD; payment_initiate_props may send cents
+// SRV_AMT is already whole JMD (from public order endpoint) — skip jmd() for it
 function jmd(raw,cur){
   var n=parseFloat(raw)||0;if(!n)return 0;
   cur=(cur||'').toUpperCase();
   if(cur==='USD')return Math.round((n>=100?n/100:n)*155);
-  return n>=10000?Math.round(n/100):n;
+  // JMD: only divide by 100 if it looks like cents (very large number from postMessage)
+  return n>=100000?Math.round(n/100):n;
 }
 function applyAmt(amt,cur,desc,txn,ord){
   if(done)return;
-  AMT=jmd(amt,cur);if(!AMT)return;
+  AMT=parseFloat(amt)||0;if(!AMT)return;  // SRV_AMT already in JMD — use directly
   DESC=desc||'Deposit';INV=ord||txn||'';window._GHL_TXN=txn||ord||'';
   dlog('\u2714 Amount: J$'+Math.round(AMT)+' ['+DESC+']');
   $el('a').textContent='J$'+Math.round(AMT).toLocaleString();
@@ -120,6 +148,13 @@ function applyAmt(amt,cur,desc,txn,ord){
   $el('l').textContent=DESC;
   $el('b').style.display='block';
   setTimeout(openHP,500);
+}
+function applySrv(){
+  if(done||AMT>0)return;
+  if(SRV_AMT>0){
+    dlog('\u26a1 Using server order J$'+SRV_AMT+' ['+SRV_DESC+']');
+    applyAmt(SRV_AMT,SRV_CUR,SRV_DESC,SRV_ORD,SRV_ORD);
+  }
 }
 function confirmPayment(){
   if(confirmed)return;confirmed=true;clearInterval(poll);
@@ -135,27 +170,21 @@ function confirmPayment(){
 function openHP(){
   if(done)return;done=true;
   $el('b').disabled=true;ss('Opening HandyPay...');
-  dlog('\u1f680 Creating session J$'+Math.round(AMT));
+  dlog('\u1f680 Session J$'+Math.round(AMT));
   fetch('/api/create-native-session',{
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({
-      locationId:L,amountJMD:AMT,description:DESC,
-      entityId:INV,ghlTransactionId:window._GHL_TXN||'',
-      paymentType:'calendar'
-    })
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({locationId:L,amountJMD:AMT,description:DESC,entityId:INV,ghlTransactionId:window._GHL_TXN||'',paymentType:'calendar'})
   }).then(function(r){return r.json();})
   .then(function(d){
     if(!d.checkoutUrl){
-      dlog('\u274c No checkoutUrl: '+(d.error||'?'));
-      ss('Error: '+(d.error||'No checkout URL'));
-      window.parent.postMessage(JSON.stringify({type:'custom_element_error_response',error:{description:d.error||'Session error'}}),'*');
+      dlog('\u274c No URL: '+(d.error||'?'));ss('Error: '+(d.error||'No checkout URL'));
+      window.parent.postMessage(JSON.stringify({type:'custom_element_error_response',error:{description:d.error||'Error'}}),'*');
       $el('b').disabled=false;done=false;return;
     }
     SID=d.sessionId||d.paymentIntentId||'';
     dlog('\u23f3 Session '+SID.substring(0,12)+'...');
     var w=window.open(d.checkoutUrl,'_blank');
-    if(!w){ss('Popup blocked \u2014 allow popups and retry');$el('b').disabled=false;done=false;return;}
+    if(!w){ss('Popup blocked \u2014 allow popups');$el('b').disabled=false;done=false;return;}
     ss('\u23f3 HandyPay open in new tab. Return here after paying.');
     poll=setInterval(function(){
       if(!SID)return;
@@ -163,77 +192,42 @@ function openHP(){
         .then(function(r){return r.json();})
         .then(function(qd){
           if(qd.success===true)confirmPayment();
-          else if(qd.failed===true){
-            clearInterval(poll);
-            ss('Payment failed. Try again.');
-            done=false;$el('b').disabled=false;
-          }
+          else if(qd.failed===true){clearInterval(poll);ss('Failed. Try again.');done=false;$el('b').disabled=false;}
         }).catch(function(){});
     },3000);
-  }).catch(function(e){
-    dlog('\u274c session err: '+e.message);
-    ss('Error: '+e.message);
-    $el('b').disabled=false;done=false;
-  });
+  }).catch(function(e){dlog('\u274c err: '+e.message);ss('Error: '+e.message);$el('b').disabled=false;done=false;});
 }
-// ── INIT ─────────────────────────────────────────────────────────────────────
+// ── INIT ─────────────────────────────────────────────────────
 (function init(){
-  // Send ready signal (fallback for surfaces that use it)
   window.parent.postMessage(JSON.stringify({type:'custom_element_loaded'}),'*');
   window.parent.postMessage({type:'custom_element_loaded'},'*');
-
   dlog((window!==window.top?'\u2705 iframe':'\u26a0 standalone')+' | '+location.search);
-
-  // 1. Server pre-fetched order (calendar flow — primary path)
   if(SRV_AMT>0){
-    dlog('\u26a1 Server order: J$'+Math.round(SRV_AMT)+' ['+SRV_DESC+'] id:'+SRV_ORD.substring(0,10)+'...');
-    // Small delay so postMessage can win for invoice flow if it arrives first
-    setTimeout(function(){applyAmt(SRV_AMT,SRV_CUR,SRV_DESC,SRV_ORD,SRV_ORD);},1000);
+    dlog('\u26a1 Server: J$'+SRV_AMT+' id:'+SRV_ORD.substring(0,10)+'...');
+    // Wait 1s so payment_initiate_props wins for invoice surfaces
+    setTimeout(applySrv,1000);
   } else {
     dlog('\u23f3 No server order — waiting for postMessage...');
   }
-
-  // 2. URL params
   if(URL_AMT>0)applyAmt(URL_AMT,URL_CUR,'',URL_TXN,URL_TXN);
-
-  // 3. window.name
-  var winName='';try{winName=window.name||'';}catch(e){}
-  if(winName){
-    dlog('window.name: '+winName.substring(0,40));
-    var nd=null;try{nd=JSON.parse(winName);}catch(e){}
-    if(nd&&nd.orderId){
-      fetch('/api/ghl-order?orderId='+encodeURIComponent(nd.orderId))
-        .then(function(r){return r.json();})
-        .then(function(d){if(d.amount>0)applyAmt(d.amount,d.currency,d.description,d.transactionId,d.orderId);})
-        .catch(function(){});
-    } else if(nd&&(nd.amount||nd.amountJMD)){
-      applyAmt(nd.amount||nd.amountJMD,nd.currency,nd.description,nd.transactionId||'',nd.orderId||'');
-    }
-  }
-
-  // 4. Timeout fallback warning
-  setTimeout(function(){
-    if(!done&&AMT===0)dlog('\u26a0 10s: still no amount \u2014 check GHL payments config');
-  },10000);
+  setTimeout(function(){if(!done&&AMT===0)dlog('\u26a0 10s: still no amount');},10000);
 })();
-
-// ── MESSAGE LISTENER (fallback: invoice flow sends payment_initiate_props) ────
-window.addEventListener('message',function(e){
+// ── MESSAGE LISTENER ──────────────────────────────────────────────
+ window.addEventListener('message',function(e){
   var data;try{data=typeof e.data==='object'?e.data:JSON.parse(e.data);}catch(x){return;}
   if(!data)return;
   var t=data.type||'';
   if(t==='PAYMENT_SUCCESS'){confirmPayment();return;}
   if(t==='payment_initiate_props'){
-    dlog('\u2728 payment_initiate_props! amt='+(data.amount||data.amountJMD||'?'));
+    dlog('\u2728 payment_initiate_props! amt='+(data.amount||'?'));
     var pAmt=data.amount||data.amountJMD||0;
     var pOrd=data.entityId||data.invoiceId||data.orderId||'';
     var pTxn=data.transactionId||data.paymentIntentId||'';
-    if(pAmt>0)applyAmt(pAmt,data.currency,data.description||data.name,pTxn,pOrd);
+    if(pAmt>0)applyAmt(jmd(pAmt,data.currency),data.currency,data.description||data.name,pTxn,pOrd);
     else if(pOrd){
       fetch('/api/ghl-order?orderId='+encodeURIComponent(pOrd))
         .then(function(r){return r.json();})
-        .then(function(d){if(d.amount>0)applyAmt(d.amount,d.currency,d.description,d.transactionId,d.orderId);})
-        .catch(function(){});
+        .then(function(d){if(d.amount>0)applyAmt(d.amount,d.currency,d.description,d.transactionId,d.orderId);}).catch(function(){});
     }
   }
   dlog('\u1f4e8 msg:'+t+' from:'+e.origin.substring(0,30));
@@ -241,9 +235,7 @@ window.addEventListener('message',function(e){
 `;
 
   const html = `<!DOCTYPE html><html><head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>HandyPay</title>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HandyPay</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#f8faff;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:20px}
