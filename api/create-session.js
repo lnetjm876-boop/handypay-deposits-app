@@ -4,9 +4,10 @@
 // Fixes vs server.js version:
 //   - Accepts currency param -> live currency passed to HandyPay (no hardcoded 'jmd')
 //   - Accepts paymentChoice ('deposit'|'full') -> stored as payment_type in DB
-//   - Session deduplication: reuse existing pending session within 30 min
+//   - Session deduplication: reuse existing pending session within 2 hours
 //   - Pool config: max:2, idleTimeoutMillis:10000
 //   - Unwrap HandyPay .data envelope: response is {success,data:{id,url}} not {id,url}
+//   - Friendly error for HandyPay 'too many sessions' rate limit
 'use strict';
 
 const { Pool } = require('pg');
@@ -48,8 +49,16 @@ async function createHandyPaySession(apiKey, amountJMD, label, meta, passFeesToC
   });
 
   if (!r.ok) {
-    var errText = await r.text();
-    throw new Error('HandyPay ' + r.status + ': ' + errText.substring(0, 120));
+    var errBody = {};
+    try { errBody = await r.json(); } catch(e) {}
+    var errMsg = JSON.stringify(errBody).toLowerCase();
+
+    // HandyPay rate-limits open sessions — give a clear, actionable message
+    if (r.status === 429 || errMsg.includes('too many') || errMsg.includes('session limit')) {
+      throw new Error('too_many_sessions: An open payment session already exists. Please wait a few minutes and try again.');
+    }
+
+    throw new Error('HandyPay ' + r.status + ': ' + JSON.stringify(errBody).substring(0, 120));
   }
 
   var d = await r.json();
@@ -89,15 +98,16 @@ module.exports = async function handler(req, res) {
 
     // ── SESSION DEDUPLICATION ────────────────────────────────────────────────
     // Reuse an existing pending session for the same location + amount created
-    // within the last 30 minutes. Prevents duplicate checkout sessions when the
-    // GHL iframe reloads (back button, refresh, slow network).
+    // within the last 2 hours. Prevents duplicate checkout sessions when the
+    // GHL iframe reloads (back button, refresh, slow network, or pre-fix retries
+    // that created sessions on HandyPay but errored before DB insert).
     try {
       var existing = await pool.query(
         `SELECT session_id, checkout_url FROM payment_logs
          WHERE location_id = $1
            AND status = 'pending'
            AND amount = $2
-           AND created_at > NOW() - INTERVAL '30 minutes'
+           AND created_at > NOW() - INTERVAL '2 hours'
          ORDER BY created_at DESC
          LIMIT 1`,
         [locationId, amountJMD]
@@ -177,6 +187,10 @@ module.exports = async function handler(req, res) {
 
   } catch (e) {
     console.error('[create-session] error:', e.message);
-    return res.status(500).json({ error: e.message || 'Failed to create payment session' });
+    // Surface friendly message for rate-limit errors
+    var userMsg = e.message && e.message.startsWith('too_many_sessions:')
+      ? 'An open payment session already exists. Please wait a few minutes and try again.'
+      : (e.message || 'Failed to create payment session');
+    return res.status(500).json({ error: userMsg });
   }
 };
