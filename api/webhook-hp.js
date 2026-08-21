@@ -6,7 +6,8 @@
 //   - CORRECT TAGGING: reads paymentChoice from metadata -> 'deposit-paid' OR 'full-payment-paid'
 //   - AWAIT tag+note before responding (prevents Vercel fire-and-forget function kill)
 //   - Raw body via stream for HMAC signature verification
-//   - Pool config: max:2
+//   - CONFIG FIX: handler.config attached AFTER defining handler (was wiped by module.exports reassignment)
+//   - Pool config: max:3
 'use strict';
 
 const crypto = require('crypto');
@@ -14,18 +15,14 @@ const { Pool } = require('pg');
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  max: 2,
+  max: 3,
   idleTimeoutMillis: 10000,
   connectionTimeoutMillis: 5000
 });
 
-// Disable Vercel's automatic body parser so we get the raw stream
-// Required for HMAC-SHA256 webhook signature verification
-module.exports.config = { api: { bodyParser: false } };
-
 const GHL_API = 'https://services.leadconnectorhq.com';
 
-// ── Helpers ─────────────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────────────
 async function getRawBody(req) {
   return new Promise((resolve, reject) => {
     var chunks = [];
@@ -62,7 +59,7 @@ async function addContactTag(accessToken, contactId, tags) {
     body: JSON.stringify({ tags: tags })
   });
   if (!r.ok) console.error('[webhook-hp] tag failed:', r.status);
-  return r.json().catch(function(){}); 
+  return r.json().catch(function(){});
 }
 
 async function addContactNote(accessToken, contactId, body) {
@@ -75,14 +72,14 @@ async function addContactNote(accessToken, contactId, body) {
   return r.json().catch(function(){});
 }
 
-// ── Signature verification (Stripe-style HMAC-SHA256) ────────────────────────
+// ── Signature verification (Stripe-style HMAC-SHA256) ──────────────────────────
 function verifySignature(rawBody, sigHeader, secret) {
-  if (!sigHeader || !secret) return true; // skip if not configured
+  if (!sigHeader || !secret) return true;
   try {
     var parts     = sigHeader.split(',');
     var tPart     = parts.find(function(p){ return p.startsWith('t='); });
     var v1Part    = parts.find(function(p){ return p.startsWith('v1='); });
-    if (!tPart || !v1Part) return true; // can't verify, allow
+    if (!tPart || !v1Part) return true;
     var timestamp = tPart.substring(2);
     var signature = v1Part.substring(3);
     var payload   = timestamp + '.' + rawBody;
@@ -90,12 +87,12 @@ function verifySignature(rawBody, sigHeader, secret) {
     return crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(signature, 'hex'));
   } catch(e) {
     console.warn('[webhook-hp] signature verify error:', e.message);
-    return true; // fail open (log only)
+    return true;
   }
 }
 
-// ── Handler ──────────────────────────────────────────────────────────────────
-module.exports = async function handler(req, res) {
+// ── Handler ────────────────────────────────────────────────────────────────────────────
+const handler = async function(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
 
   // Read raw body for signature verification
@@ -112,7 +109,7 @@ module.exports = async function handler(req, res) {
   // Extract fields
   var type       = obj.type || obj.event || '';
   var dataObj    = obj.data || {};
-  var sessionId  = (dataObj.id || dataObj.sessionId || dataObj.object && dataObj.object.id) || obj.sessionId || obj.id || '';
+  var sessionId  = (dataObj.id || dataObj.sessionId || (dataObj.object && dataObj.object.id)) || obj.sessionId || obj.id || '';
   var meta       = (dataObj.metadata || (dataObj.object && dataObj.object.metadata)) || obj.metadata || {};
   var locationId = meta.locationId || '';
 
@@ -137,7 +134,7 @@ module.exports = async function handler(req, res) {
   var isPaid = ['payment.succeeded','checkout.session.completed','payment_intent.succeeded'].indexOf(type) !== -1;
   if (!isPaid) return res.json({ ok: true, skipped: type });
 
-  // ── IDEMPOTENCY CHECK ────────────────────────────────────────────────────
+  // ── IDEMPOTENCY CHECK ────────────────────────────────────────────────
   // Stripe retries webhooks on non-200. If we already marked this session paid,
   // skip all processing so contacts don't get double-tagged/double-noted.
   if (sessionId) {
@@ -188,7 +185,7 @@ module.exports = async function handler(req, res) {
     return res.json({ ok: true, note: 'no_token' });
   }
 
-  // ── CORRECT TAGGING based on paymentChoice ───────────────────────────────
+  // ── CORRECT TAGGING based on paymentChoice ──────────────────────────────────────
   var tag, noteText;
   if (payChoice === 'full') {
     tag      = 'full-payment-paid';
@@ -212,3 +209,11 @@ module.exports = async function handler(req, res) {
 
   return res.json({ ok: true, tag, amount, currency, payChoice });
 };
+
+// CRITICAL: config must be attached to the handler function BEFORE exporting.
+// Setting module.exports.config before reassigning module.exports = handler
+// would wipe the config property (JS object reference is replaced entirely).
+// With this pattern, Vercel reads handler.config and disables body parsing,
+// allowing getRawBody() to read the raw stream for HMAC signature verification.
+handler.config = { api: { bodyParser: false } };
+module.exports = handler;
