@@ -9,26 +9,20 @@
     { "src": "api/query.js",            "use": "@vercel/node" },
     { "src": "api/success.js",          "use": "@vercel/node" },
     { "src": "api/pay.js",              "use": "@vercel/node" },
-    { "src": "api/debug-log.js",        "use": "@vercel/node" },
-    { "src": "api/ghl-order.js",        "use": "@vercel/node" },
-    { "src": "api/debug-token.js",      "use": "@vercel/node" },
     { "src": "api/create-session.js",   "use": "@vercel/node" },
     { "src": "api/webhook-hp.js",       "use": "@vercel/node" }
   ],
   "routes": [
-    { "src": "/api/cron-retry",         "dest": "api/cron-retry.js" },
-    { "src": "/api/fix-db",             "dest": "api/fix-db.js" },
-    { "src": "/api/refresh-token",      "dest": "api/refresh-token.js" },
-    { "src": "/api/ghl-setup",          "dest": "api/ghl-setup.js" },
-    { "src": "/api/debug-log",          "dest": "api/debug-log.js" },
-    { "src": "/api/debug-token",        "dest": "api/debug-token.js" },
-    { "src": "/api/ghl-order",          "dest": "api/ghl-order.js" },
-    { "src": "/api/create-native-session", "dest": "api/create-session.js" },
-    { "src": "/api/webhooks/handypay",  "dest": "api/webhook-hp.js" },
-    { "src": "/api/query/([^/]+)",      "dest": "api/query.js?paymentIntentId=$1" },
-    { "src": "/api/query",              "dest": "api/query.js" },
-    { "src": "/success",                "dest": "api/success.js" },
-    { "src": "/api/pay",                "dest": "api/pay.js" },
-    { "src": "/(.*)",                   "dest": "server.js" }
+    { "src": "/api/cron-retry",             "dest": "api/cron-retry.js" },
+    { "src": "/api/fix-db",                 "dest": "api/fix-db.js" },
+    { "src": "/api/refresh-token",          "dest": "api/refresh-token.js" },
+    { "src": "/api/ghl-setup",              "dest": "api/ghl-setup.js" },
+    { "src": "/api/create-native-session",  "dest": "api/create-session.js" },
+    { "src": "/api/webhooks/handypay",      "dest": "api/webhook-hp.js" },
+    { "src": "/api/query/([^/]+)",          "dest": "api/query.js?paymentIntentId=$1" },
+    { "src": "/api/query",                  "dest": "api/query.js" },
+    { "src": "/success",                    "dest": "api/success.js" },
+    { "src": "/api/pay",                    "dest": "api/pay.js" },
+    { "src": "/(.*)",                       "dest": "server.js" }
   ]
 }
