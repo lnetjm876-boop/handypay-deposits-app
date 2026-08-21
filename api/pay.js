@@ -1,28 +1,26 @@
 // api/pay.js — GHL Custom Payment Provider iframe
-// v3: Full/Deposit choice + live currency + iOS popup fix + no debug overlay
+// v4: Concurrent-booking safe
 //
-// KEY FINDINGS (preserved from v2):
+// KEY FINDINGS (preserved from v3):
 //   - GHL calendar NEVER sends payment_initiate_props postMessage
 //   - Server-side order fetch is the only viable approach
 //   - GHL iframe sandbox="" (no restrictions), allow="payment"
 //   - window.open() must fire from direct user click (not setTimeout)
 //   - Sort orders by _id DESC (MongoDB ObjectID = newest first)
 //
-// v3 CHANGES:
-//   - Full/Deposit choice: reads pd.amount (full) vs pd.paymentSummary.initialAmount (deposit)
-//     Shows two cards when amounts differ, single button when equal (fixed deposit mode)
-//   - iOS Safari fix: window.open('','_blank') called synchronously in button click
-//     handler, then navigated to checkoutUrl after session creation
-//   - Live currency: reads pd.currency from GHL order, sends to /api/create-native-session
-//   - Debug overlay removed: no #dbg div or dlog() in production
-//   - Pool config: max:2 to reduce connection pressure in serverless
+// v4 CHANGES:
+//   - FAST PATH: if GHL passes orderId/paymentIntentId in URL, fetch that specific
+//     order directly (no token needed — public endpoint) BEFORE the latest-order lookup.
+//     Eliminates the "latest order" race condition when multiple customers book
+//     the same service simultaneously.
+//   - Pool config: max:3 (up from 2) to handle modest concurrency
 'use strict';
 
 const { Pool } = require('pg');
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  max: 2,
+  max: 3,
   idleTimeoutMillis: 10000,
   connectionTimeoutMillis: 5000
 });
@@ -83,6 +81,18 @@ async function fetchOrders(locationId, token) {
   return [];
 }
 
+// Shared helper: parse a GHL public order object into {depAmt, fullAmt, cur, desc}
+function parseOrderAmounts(pd) {
+  const depAmt   = (pd.paymentSummary && pd.paymentSummary.initialAmount > 0) ? pd.paymentSummary.initialAmount : 0;
+  const totalAmt = pd.amount || 0;
+  return {
+    depAmt:  depAmt || totalAmt,
+    fullAmt: (totalAmt > (depAmt || totalAmt) && (depAmt || totalAmt) > 0) ? totalAmt : 0,
+    cur:     (pd.currency || 'JMD').toUpperCase(),
+    desc:    (pd.source && pd.source.name) || 'Booking Deposit'
+  };
+}
+
 module.exports = async function handler(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'GET only' });
 
@@ -96,11 +106,42 @@ module.exports = async function handler(req, res) {
   res.setHeader('X-Frame-Options', 'ALLOWALL');
   res.setHeader('Content-Type', 'text/html');
 
-  // ── Server-side order fetch ───────────────────────────────────────────────────────────────────────────
   let srvOrderId = '', srvDepAmt = 0, srvFullAmt = 0, srvOrderCur = 'JMD', srvOrderDesc = '';
   let tokenStatus = 'no_location';
 
-  if (locationId) {
+  // ── FAST PATH: direct order fetch by URL-supplied order ID ────────────────
+  // GHL sometimes passes the order/payment-intent ID in the URL when loading
+  // the payment iframe. When present, fetch that specific order directly via
+  // the unauthenticated public endpoint — no CRM token needed.
+  // This short-circuits the "fetch latest order" approach and isolates each
+  // customer's session correctly even under concurrent load.
+  if (urlTxId) {
+    try {
+      const pr = await fetchWithTimeout(
+        'https://backend.leadconnectorhq.com/payments/orders/public/' + urlTxId, {}, 2000
+      );
+      if (pr.ok) {
+        const pd = await pr.json();
+        const { depAmt, fullAmt, cur, desc } = parseOrderAmounts(pd);
+        srvDepAmt    = depAmt;
+        srvFullAmt   = fullAmt;
+        srvOrderCur  = cur;
+        srvOrderDesc = desc;
+        srvOrderId   = urlTxId;
+        tokenStatus  = 'url_direct';
+        console.log('[pay] ✅ url-direct dep:', srvDepAmt, 'full:', srvFullAmt, cur, 'id:', urlTxId);
+      }
+    } catch(e) {
+      console.warn('[pay] url-direct failed, falling back to order list:', e.message);
+    }
+  }
+
+  // ── FALLBACK: fetch latest order via CRM token ───────────────────────────
+  // Used when GHL does not include the order ID in the URL (calendar flow).
+  // Fetches the 5 most recent unpaid orders for this location and picks the
+  // newest calendar order. Race-prone when multiple customers book simultaneously
+  // but there is no alternative when the order ID is not in the URL.
+  if (locationId && !srvOrderId) {
     try {
       const { rows } = await pool.query(
         'SELECT crm_access_token, crm_refresh_token FROM merchant_configs WHERE location_id=$1 LIMIT 1',
@@ -122,11 +163,9 @@ module.exports = async function handler(req, res) {
         }
         console.log('[pay] orders count:', Array.isArray(orders) ? orders.length : 0);
 
-        // Sort by _id descending (MongoDB ObjectID encodes timestamp = newest first)
         const sorted = Array.isArray(orders)
           ? [...orders].sort((a, b) => ((b._id || '') > (a._id || '') ? 1 : -1))
           : [];
-
         const calOrder = sorted.find(o => o.sourceType === 'calendar' || (o.source && o.source.type === 'calendar'))
           || sorted[0] || null;
         const orderId  = calOrder ? (calOrder._id || '') : '';
@@ -135,17 +174,13 @@ module.exports = async function handler(req, res) {
           try {
             const pr = await fetchWithTimeout('https://backend.leadconnectorhq.com/payments/orders/public/' + orderId, {}, 2000);
             if (pr.ok) {
-              const pd       = await pr.json();
-              // depAmt = what GHL wants collected now (initialAmount = deposit)
-              // totalAmt = full service price (amount field on the order)
-              const depAmt   = (pd.paymentSummary && pd.paymentSummary.initialAmount > 0) ? pd.paymentSummary.initialAmount : 0;
-              const totalAmt = pd.amount || 0;
-              srvDepAmt      = depAmt || totalAmt;         // deposit to show/charge
-              // Only expose full option when GHL set % deposit (amounts are genuinely different)
-              srvFullAmt     = (totalAmt > srvDepAmt && srvDepAmt > 0) ? totalAmt : 0;
-              srvOrderCur    = (pd.currency || 'JMD').toUpperCase();
-              srvOrderDesc   = (pd.source && pd.source.name) || 'Booking Deposit';
-              srvOrderId     = orderId;
+              const pd = await pr.json();
+              const { depAmt, fullAmt, cur, desc } = parseOrderAmounts(pd);
+              srvDepAmt    = depAmt;
+              srvFullAmt   = fullAmt;
+              srvOrderCur  = cur;
+              srvOrderDesc = desc;
+              srvOrderId   = orderId;
               console.log('[pay] ✅ dep:', srvDepAmt, 'full:', srvFullAmt, srvOrderCur, 'orderId:', orderId);
             }
           } catch (pe) { console.error('[pay] public order:', pe.message); }
@@ -163,13 +198,12 @@ module.exports = async function handler(req, res) {
             try {
               const pr = await fetchWithTimeout('https://backend.leadconnectorhq.com/payments/orders/public/' + orderId, {}, 2000);
               if (pr.ok) {
-                const pd     = await pr.json();
-                const depAmt = (pd.paymentSummary && pd.paymentSummary.initialAmount > 0) ? pd.paymentSummary.initialAmount : 0;
-                const totalAmt = pd.amount || 0;
-                srvDepAmt    = depAmt || totalAmt;
-                srvFullAmt   = (totalAmt > srvDepAmt && srvDepAmt > 0) ? totalAmt : 0;
-                srvOrderCur  = (pd.currency || 'JMD').toUpperCase();
-                srvOrderDesc = (pd.source && pd.source.name) || 'Booking Deposit';
+                const pd = await pr.json();
+                const { depAmt, fullAmt, cur, desc } = parseOrderAmounts(pd);
+                srvDepAmt    = depAmt;
+                srvFullAmt   = fullAmt;
+                srvOrderCur  = cur;
+                srvOrderDesc = desc;
                 srvOrderId   = orderId;
                 console.log('[pay] ✅ dep (cold):', srvDepAmt, 'full:', srvFullAmt);
               }
@@ -185,7 +219,6 @@ module.exports = async function handler(req, res) {
 
   console.log('[pay] final dep:', srvDepAmt, 'full:', srvFullAmt, 'status:', tokenStatus);
 
-  // Template variables for client JS
   const L        = JSON.stringify(locationId);
   const URL_AMT  = JSON.stringify(urlAmount);
   const URL_CUR  = JSON.stringify(urlCurrency);
@@ -219,14 +252,12 @@ function applyAmts(dep,full,cur,desc,ord){
   $el('svc').textContent=DESC;
 
   if(FULL_AMT>DEP_AMT){
-    // Two-card layout: Deposit vs Full
     $el('dep-amt').textContent=fmt(DEP_AMT,CUR);
     $el('full-amt').textContent=fmt(FULL_AMT,CUR);
     $el('opts').style.display='flex';
     $el('single').style.display='none';
     ss('Choose how much to pay to secure your booking');
   } else {
-    // Single button (fixed deposit mode)
     $el('single-amt').textContent=fmt(DEP_AMT,CUR);
     $el('single').style.display='block';
     $el('opts').style.display='none';
@@ -252,13 +283,8 @@ function openHP(choice){
   if(!amt)return;
   done=true;
 
-  // iOS Safari fix: open blank tab SYNCHRONOUSLY in the user gesture handler.
-  // window.open() is allowed on iOS only when called from a direct user click.
-  // We open an empty tab immediately, then navigate it to HandyPay once we have
-  // the checkoutUrl from the server. This pattern works on all browsers.
   var w=window.open('','_blank');
 
-  // Disable all buttons while creating session
   ['btn-dep','btn-full','btn-single'].forEach(function(id){
     var el=$el(id);if(el)el.disabled=true;
   });
@@ -280,7 +306,6 @@ function openHP(choice){
   }).then(function(r){return r.json();})
   .then(function(d){
     if(!d.checkoutUrl){
-      // Session creation failed
       if(w)try{w.close();}catch(e){}
       ss('Error: '+(d.error||'Could not create checkout. Please try again.'));
       window.parent.postMessage(JSON.stringify({type:'custom_element_error_response',error:{description:d.error||'Payment error'}}),'*');
@@ -290,10 +315,8 @@ function openHP(choice){
     SID=d.sessionId||d.paymentIntentId||'';
 
     if(w&&!w.closed){
-      // Navigate the pre-opened blank tab to HandyPay (iOS Safari pattern)
       w.location.href=d.checkoutUrl;
     } else {
-      // Blank tab was blocked or closed — try opening directly
       w=window.open(d.checkoutUrl,'_blank');
       if(!w){
         ss('\u26a0 Please allow popups for this site, then tap the button again.');
@@ -304,7 +327,6 @@ function openHP(choice){
 
     ss('\u23f3 Complete payment in the HandyPay tab, then return here.');
 
-    // Poll every 3s for payment completion
     poll=setInterval(function(){
       if(!SID)return;
       fetch('/api/query?paymentIntentId='+SID)
@@ -331,14 +353,11 @@ function openHP(choice){
   window.parent.postMessage(JSON.stringify({type:'custom_element_loaded'}),'*');
   window.parent.postMessage({type:'custom_element_loaded'},'*');
   if(SRV_DEP>0){
-    // Delay 800ms to let GHL finish its own init before we modify the iframe
     setTimeout(function(){if(!done&&DEP_AMT===0)applyAmts(SRV_DEP,SRV_FULL,SRV_CUR,SRV_DESC,SRV_ORD);},800);
   }
-  // URL param fallback (invoice flow)
   if(URL_AMT>0)applyAmts(URL_AMT,0,URL_CUR,'',URL_TXN);
 })();
 
-// postMessage listener: GHL payment_initiate_props (invoice/order form flow)
 window.addEventListener('message',function(e){
   var data;try{data=typeof e.data==='object'?e.data:JSON.parse(e.data);}catch(x){return;}
   if(!data)return;
@@ -346,7 +365,6 @@ window.addEventListener('message',function(e){
   if(t==='PAYMENT_SUCCESS'){confirmPayment();return;}
   if(t==='payment_initiate_props'){
     var pAmt=parseFloat(data.amount||data.amountJMD||0);
-    // GHL sends amount in cents for some flows — normalise if >= 100000
     if(pAmt>0)applyAmts(
       pAmt>=100000?Math.round(pAmt/100):pAmt,
       0,
@@ -365,7 +383,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .logo{font-size:36px;margin-bottom:6px}
 .brand{font-size:17px;font-weight:800;color:#1a1a1a;margin-bottom:4px}
 .svc{font-size:13px;color:#666;margin-bottom:20px;min-height:16px;line-height:1.4}
-/* Two-option layout */
 .opts{display:none;gap:10px;margin-bottom:16px}
 .opt-btn{flex:1;background:#fff;border:2px solid #e2e8f0;border-radius:12px;padding:14px 8px;cursor:pointer;transition:border-color .15s,background .15s;text-align:center;font-family:inherit}
 .opt-btn:hover:not(:disabled){border-color:#15803d;background:#f0fdf4}
@@ -373,12 +390,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .opt-label{font-size:11px;font-weight:700;color:#666;text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px}
 .opt-amt{font-size:20px;font-weight:800;color:#15803d;margin-bottom:3px}
 .opt-sub{font-size:11px;color:#888}
-/* Single button layout */
 .single{display:none;margin-bottom:16px}
 .single-amt{font-size:28px;font-weight:800;color:#15803d;margin-bottom:14px}
 .btn{background:#15803d;color:#fff;border:none;border-radius:10px;padding:13px 24px;font-size:15px;font-weight:700;cursor:pointer;width:100%;font-family:inherit}
 .btn:disabled{opacity:.6;cursor:not-allowed}
-/* Status text */
 .st{font-size:13px;color:#555;margin-top:10px;min-height:18px;line-height:1.5}
 `;
 
