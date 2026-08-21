@@ -2,11 +2,12 @@
 // Overrides /api/webhooks/handypay route from server.js catch-all.
 //
 // Fixes vs server.js version:
-//   - IDEMPOTENCY: skips if session already status='paid' (prevents double-tag on Stripe webhook retry)
-//   - CORRECT TAGGING: reads paymentChoice from metadata -> 'deposit-paid' OR 'full-payment-paid'
-//   - AWAIT tag+note before responding (prevents Vercel fire-and-forget function kill)
-//   - Raw body via stream for HMAC signature verification
-//   - CONFIG FIX: handler.config attached AFTER defining handler (was wiped by module.exports reassignment)
+//   - IDEMPOTENCY: skips if session already status='paid'
+//   - CORRECT TAGGING: 'deposit-paid' OR 'full-payment-paid' based on paymentChoice
+//   - AWAIT tag+note before responding (prevents Vercel fire-and-forget kill)
+//   - CONFIG FIX: handler.config attached after defining handler
+//   - CONTACT LOOKUP: if contactId not in metadata, fetches GHL order by entityId
+//     to resolve the contactId dynamically (fixes no_contact on all calendar bookings)
 //   - Pool config: max:3
 'use strict';
 
@@ -72,6 +73,30 @@ async function addContactNote(accessToken, contactId, body) {
   return r.json().catch(function(){});
 }
 
+// ── Look up contactId from a GHL order ────────────────────────────────────────
+async function lookupContactId(accessToken, orderId) {
+  if (!accessToken || !orderId) return '';
+  try {
+    var r = await fetch(GHL_API + '/payments/orders/' + orderId, {
+      headers: { 'Authorization': 'Bearer ' + accessToken, 'Version': '2021-07-28' }
+    });
+    if (!r.ok) {
+      console.warn('[webhook-hp] order lookup', r.status, 'for orderId:', orderId);
+      return '';
+    }
+    var d = await r.json();
+    // GHL order has contactId at top level or nested under contact object
+    var cid = d.contactId || d.contact_id
+      || (d.contact && (d.contact.id || d.contact._id))
+      || '';
+    console.log('[webhook-hp] order lookup contactId:', cid || 'not_found', 'orderId:', orderId);
+    return cid;
+  } catch(e) {
+    console.warn('[webhook-hp] order lookup error:', e.message);
+    return '';
+  }
+}
+
 // ── Signature verification (Stripe-style HMAC-SHA256) ──────────────────────────
 function verifySignature(rawBody, sigHeader, secret) {
   if (!sigHeader || !secret) return true;
@@ -95,18 +120,16 @@ function verifySignature(rawBody, sigHeader, secret) {
 const handler = async function(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
 
-  // Read raw body for signature verification
+  // Read raw body for HMAC signature verification
   var rawBuf;
   try { rawBuf = await getRawBody(req); }
   catch(e) { return res.status(400).json({ error: 'Failed to read body' }); }
   var rawBody = rawBuf.toString('utf8');
 
-  // Parse JSON
   var obj;
   try { obj = JSON.parse(rawBody); }
   catch(e) { return res.status(400).json({ ok: false, error: 'invalid JSON' }); }
 
-  // Extract fields
   var type       = obj.type || obj.event || '';
   var dataObj    = obj.data || {};
   var sessionId  = (dataObj.id || dataObj.sessionId || (dataObj.object && dataObj.object.id)) || obj.sessionId || obj.id || '';
@@ -115,7 +138,7 @@ const handler = async function(req, res) {
 
   console.log('[webhook-hp] type:', type, 'session:', sessionId, 'location:', locationId);
 
-  // Verify signature per sub-account webhook secret
+  // Verify signature
   if (locationId) {
     try {
       var cfg = await getMerchantConfig(locationId);
@@ -130,14 +153,11 @@ const handler = async function(req, res) {
     }
   }
 
-  // Only handle payment success events
   var isPaid = ['payment.succeeded','checkout.session.completed','payment_intent.succeeded'].indexOf(type) !== -1;
   if (!isPaid) return res.json({ ok: true, skipped: type });
 
-  // ── IDEMPOTENCY CHECK ────────────────────────────────────────────────
-  // Stripe retries webhooks on non-200. If we already marked this session paid,
-  // skip all processing so contacts don't get double-tagged/double-noted.
-  if (sessionId) {
+  // ── IDEMPOTENCY ─────────────────────────────────────────────────────────────
+if (sessionId) {
     try {
       var existingLog = await getPaymentLogBySession(sessionId);
       if (existingLog && existingLog.status === 'paid') {
@@ -149,13 +169,11 @@ const handler = async function(req, res) {
     }
   }
 
-  // Mark session paid
   if (sessionId) {
     try { await updatePaymentLogStatus(sessionId, 'paid'); }
     catch(e) { console.error('[webhook-hp] status update error:', e.message); }
   }
 
-  // Load log for contact + amount
   var log        = sessionId ? (await getPaymentLogBySession(sessionId).catch(function(){return null;})) : null;
   var contactId  = meta.contactId || (log && log.contact_id) || '';
   if (!locationId) locationId = (log && log.location_id) || '';
@@ -163,30 +181,41 @@ const handler = async function(req, res) {
     ? Math.round(((dataObj.amount_total || dataObj.object.amount_total) || 0) / 100)
     : (log && log.amount) || 0;
   var currency   = (log && log.currency ? log.currency.toUpperCase() : 'JMD');
-
-  // Payment choice from metadata (set by api/create-session.js)
   var payChoice  = meta.paymentChoice || (log && log.payment_type) || 'deposit';
   var payType    = meta.paymentType   || (log && log.payment_type) || 'deposit';
 
-  // Skip CRM actions for GHL native flow (invoice confirmation handled separately)
   if (payType === 'ghl_native') {
     console.log('[webhook-hp] ghl_native — skipping contact tag/note');
     return res.json({ ok: true, mode: 'ghl_native' });
   }
 
-  if (!contactId || !locationId) {
-    console.log('[webhook-hp] no contactId/locationId — skipping tag/note');
-    return res.json({ ok: true, note: 'no_contact' });
-  }
+  if (!locationId) return res.json({ ok: true, note: 'no_location' });
 
+  // Fetch token once — used for both order lookup + tagging
   var accessToken = await getFreshToken(locationId).catch(function(){return '';});
   if (!accessToken) {
     console.error('[webhook-hp] no CRM token for:', locationId);
     return res.json({ ok: true, note: 'no_token' });
   }
 
-  // ── CORRECT TAGGING based on paymentChoice ──────────────────────────────────────
-  var tag, noteText;
+  // ── CONTACT LOOKUP ─────────────────────────────────────────────────────────────
+  // contactId is NOT in HandyPay metadata (never included at session-creation time).
+  // Fall back to fetching the GHL order by entityId to resolve it dynamically.
+  // This covers 100% of calendar booking payments.
+  if (!contactId) {
+    var orderId = meta.entityId || meta.ghlTransactionId || (log && log.ghl_transaction_id) || '';
+    if (orderId) {
+      contactId = await lookupContactId(accessToken, orderId);
+    }
+  }
+
+  if (!contactId) {
+    console.log('[webhook-hp] contactId not found after order lookup — skipping tag/note');
+    return res.json({ ok: true, note: 'no_contact' });
+  }
+
+  // ── TAGGING ──────────────────────────────────────────────────────────────────────
+var tag, noteText;
   if (payChoice === 'full') {
     tag      = 'full-payment-paid';
     noteText = 'Full payment received via HandyPay: ' + amount + ' ' + currency;
@@ -195,8 +224,6 @@ const handler = async function(req, res) {
     noteText = 'Deposit received via HandyPay: ' + amount + ' ' + currency;
   }
 
-  // Await BOTH before responding — prevents Vercel from killing the function
-  // before the GHL API calls complete (fire-and-forget truncation bug)
   try {
     await Promise.all([
       addContactTag(accessToken, contactId, [tag]),
@@ -207,13 +234,10 @@ const handler = async function(req, res) {
     console.error('[webhook-hp] tag/note error:', e.message);
   }
 
-  return res.json({ ok: true, tag, amount, currency, payChoice });
+  return res.json({ ok: true, tag, amount, currency, payChoice, contactId });
 };
 
-// CRITICAL: config must be attached to the handler function BEFORE exporting.
-// Setting module.exports.config before reassigning module.exports = handler
-// would wipe the config property (JS object reference is replaced entirely).
-// With this pattern, Vercel reads handler.config and disables body parsing,
-// allowing getRawBody() to read the raw stream for HMAC signature verification.
+// Config MUST be attached to handler after definition.
+// Setting module.exports.config before module.exports = handler wipes the config.
 handler.config = { api: { bodyParser: false } };
 module.exports = handler;
