@@ -10,7 +10,8 @@
     { "src": "api/success.js",          "use": "@vercel/node" },
     { "src": "api/pay.js",              "use": "@vercel/node" },
     { "src": "api/create-session.js",   "use": "@vercel/node" },
-    { "src": "api/webhook-hp.js",       "use": "@vercel/node" }
+    { "src": "api/webhook-hp.js",       "use": "@vercel/node" },
+    { "src": "api/balance.js",          "use": "@vercel/node" }
   ],
   "routes": [
     { "src": "/api/cron-retry",             "dest": "api/cron-retry.js" },
@@ -19,6 +20,7 @@
     { "src": "/api/ghl-setup",              "dest": "api/ghl-setup.js" },
     { "src": "/api/create-native-session",  "dest": "api/create-session.js" },
     { "src": "/api/webhooks/handypay",      "dest": "api/webhook-hp.js" },
+    { "src": "/api/balance",               "dest": "api/balance.js" },
     { "src": "/api/query/([^/]+)",          "dest": "api/query.js?paymentIntentId=$1" },
     { "src": "/api/query",                  "dest": "api/query.js" },
     { "src": "/success",                    "dest": "api/success.js" },
