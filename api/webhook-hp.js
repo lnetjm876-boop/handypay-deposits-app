@@ -6,8 +6,8 @@
 //   - CORRECT TAGGING: 'deposit-paid' OR 'full-payment-paid' based on paymentChoice
 //   - AWAIT tag+note before responding (prevents Vercel fire-and-forget kill)
 //   - CONFIG FIX: handler.config attached after defining handler
-//   - CONTACT LOOKUP: if contactId not in metadata, fetches GHL order by entityId
-//     to resolve the contactId dynamically (fixes no_contact on all calendar bookings)
+//   - CONTACT LOOKUP: if contactId not in metadata, fetches GHL order by entityId.
+//     GHL /payments/orders/:id REQUIRES ?altId={locationId}&altType=location query params.
 //   - Pool config: max:3
 'use strict';
 
@@ -74,18 +74,21 @@ async function addContactNote(accessToken, contactId, body) {
 }
 
 // ── Look up contactId from a GHL order ────────────────────────────────────────
-async function lookupContactId(accessToken, orderId) {
-  if (!accessToken || !orderId) return '';
+// IMPORTANT: GHL GET /payments/orders/:id requires ?altId={locationId}&altType=location
+// Without these query params the endpoint returns 422.
+async function lookupContactId(accessToken, orderId, locationId) {
+  if (!accessToken || !orderId || !locationId) return '';
   try {
-    var r = await fetch(GHL_API + '/payments/orders/' + orderId, {
+    var url = GHL_API + '/payments/orders/' + orderId
+      + '?altId=' + encodeURIComponent(locationId) + '&altType=location';
+    var r = await fetch(url, {
       headers: { 'Authorization': 'Bearer ' + accessToken, 'Version': '2021-07-28' }
     });
     if (!r.ok) {
-      console.warn('[webhook-hp] order lookup', r.status, 'for orderId:', orderId);
+      console.warn('[webhook-hp] order lookup', r.status, 'orderId:', orderId, 'loc:', locationId);
       return '';
     }
     var d = await r.json();
-    // GHL order has contactId at top level or nested under contact object
     var cid = d.contactId || d.contact_id
       || (d.contact && (d.contact.id || d.contact._id))
       || '';
@@ -120,7 +123,6 @@ function verifySignature(rawBody, sigHeader, secret) {
 const handler = async function(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
 
-  // Read raw body for HMAC signature verification
   var rawBuf;
   try { rawBuf = await getRawBody(req); }
   catch(e) { return res.status(400).json({ error: 'Failed to read body' }); }
@@ -138,7 +140,6 @@ const handler = async function(req, res) {
 
   console.log('[webhook-hp] type:', type, 'session:', sessionId, 'location:', locationId);
 
-  // Verify signature
   if (locationId) {
     try {
       var cfg = await getMerchantConfig(locationId);
@@ -157,7 +158,7 @@ const handler = async function(req, res) {
   if (!isPaid) return res.json({ ok: true, skipped: type });
 
   // ── IDEMPOTENCY ─────────────────────────────────────────────────────────────
-if (sessionId) {
+  if (sessionId) {
     try {
       var existingLog = await getPaymentLogBySession(sessionId);
       if (existingLog && existingLog.status === 'paid') {
@@ -191,7 +192,6 @@ if (sessionId) {
 
   if (!locationId) return res.json({ ok: true, note: 'no_location' });
 
-  // Fetch token once — used for both order lookup + tagging
   var accessToken = await getFreshToken(locationId).catch(function(){return '';});
   if (!accessToken) {
     console.error('[webhook-hp] no CRM token for:', locationId);
@@ -199,23 +199,21 @@ if (sessionId) {
   }
 
   // ── CONTACT LOOKUP ─────────────────────────────────────────────────────────────
-  // contactId is NOT in HandyPay metadata (never included at session-creation time).
-  // Fall back to fetching the GHL order by entityId to resolve it dynamically.
-  // This covers 100% of calendar booking payments.
   if (!contactId) {
     var orderId = meta.entityId || meta.ghlTransactionId || (log && log.ghl_transaction_id) || '';
     if (orderId) {
-      contactId = await lookupContactId(accessToken, orderId);
+      // lookupContactId now receives locationId to build correct GHL query params
+      contactId = await lookupContactId(accessToken, orderId, locationId);
     }
   }
 
   if (!contactId) {
-    console.log('[webhook-hp] contactId not found after order lookup — skipping tag/note');
+    console.log('[webhook-hp] contactId not resolved after order lookup — skipping tag/note');
     return res.json({ ok: true, note: 'no_contact' });
   }
 
   // ── TAGGING ──────────────────────────────────────────────────────────────────────
-var tag, noteText;
+  var tag, noteText;
   if (payChoice === 'full') {
     tag      = 'full-payment-paid';
     noteText = 'Full payment received via HandyPay: ' + amount + ' ' + currency;
@@ -237,7 +235,5 @@ var tag, noteText;
   return res.json({ ok: true, tag, amount, currency, payChoice, contactId });
 };
 
-// Config MUST be attached to handler after definition.
-// Setting module.exports.config before module.exports = handler wipes the config.
 handler.config = { api: { bodyParser: false } };
 module.exports = handler;
