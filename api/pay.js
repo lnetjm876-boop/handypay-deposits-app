@@ -5,12 +5,13 @@
 //   - Token in Neon expired (26h stale). Auto-refresh via crm_refresh_token.
 //   - DB schema has crm_access_token/crm_refresh_token (NO ghl_* columns).
 //   - After refresh, fetch pending calendar order, get deposit amount from public API.
-//   - Embed amount in page JS. Client auto-triggers after 1s.
-//   - Still listens for payment_initiate_props (invoice flow fallback).
+//   - Embed amount in page JS. Client shows button when ready.
+//   - User clicks button -> window.open() fires from user gesture (not blocked).
+//   - Poll detects payment -> custom_element_success_response -> GHL confirms booking.
 //
-// FIX 2: window.open() is blocked inside GHL iframe sandbox (no allow-popups).
-//   Use location.href redirect instead. After payment, HandyPay redirects to
-//   /api/success which loads in the same iframe and sends custom_element_success_response.
+// KEY FINDING: GHL payment iframe has sandbox="" (no restrictions), allow="payment".
+// window.open() IS allowed but ONLY from direct user interaction (not setTimeout).
+// Auto-trigger (setTimeout -> openHP) was blocked by browser popup blocker.
 'use strict';
 
 const { Pool } = require('pg');
@@ -115,9 +116,15 @@ module.exports = async function handler(req, res) {
         }
         console.log('[pay] orders count:', Array.isArray(orders) ? orders.length : 0);
 
-        const calOrder = Array.isArray(orders)
-          ? (orders.find(o => o.sourceType === 'calendar' || (o.source && o.source.type === 'calendar')) || orders[0])
-          : null;
+        // Sort by _id descending (MongoDB ObjectID encodes timestamp)
+        // to pick the most recently created order
+        const sortedOrders = Array.isArray(orders)
+          ? [...orders].sort((a, b) => ((b._id || '') > (a._id || '') ? 1 : -1))
+          : [];
+
+        const calOrder = sortedOrders.find(o => o.sourceType === 'calendar' || (o.source && o.source.type === 'calendar'))
+          || sortedOrders[0]
+          || null;
         const orderId = calOrder ? (calOrder._id || '') : '';
 
         if (orderId) {
@@ -140,7 +147,8 @@ module.exports = async function handler(req, res) {
         if (newTok) {
           tokenStatus = 'refreshed_cold';
           const orders = await fetchOrders(locationId, newTok) || [];
-          const calOrder = orders.find(o => o.sourceType === 'calendar' || (o.source && o.source.type === 'calendar')) || orders[0];
+          const sortedOrders = [...orders].sort((a, b) => ((b._id || '') > (a._id || '') ? 1 : -1));
+          const calOrder = sortedOrders.find(o => o.sourceType === 'calendar' || (o.source && o.source.type === 'calendar')) || sortedOrders[0];
           const orderId = calOrder ? (calOrder._id || '') : '';
           if (orderId) {
             try {
@@ -193,7 +201,11 @@ function applyAmt(amt,cur,desc,txn,ord){
   $el('a').style.display='block';
   $el('l').textContent=DESC;
   $el('b').style.display='block';
-  setTimeout(openHP,500);
+  // DO NOT auto-trigger openHP() here.
+  // window.open() is only allowed by the browser when called from a direct
+  // user interaction (button click). Auto-trigger via setTimeout is blocked
+  // by the browser popup blocker even though GHL iframe has no sandbox.
+  ss('Click to pay J$'+Math.round(AMT).toLocaleString());
 }
 function confirmPayment(){
   if(confirmed)return;confirmed=true;clearInterval(poll);
@@ -208,7 +220,7 @@ function confirmPayment(){
 }
 function openHP(){
   if(done)return;done=true;
-  $el('b').disabled=true;ss('Connecting to HandyPay...');
+  $el('b').disabled=true;ss('Opening HandyPay...');
   dlog('\u1f680 J$'+Math.round(AMT));
   fetch('/api/create-native-session',{
     method:'POST',headers:{'Content-Type':'application/json'},
@@ -222,10 +234,26 @@ function openHP(){
     }
     SID=d.sessionId||d.paymentIntentId||'';
     dlog('\u23f3 '+SID.substring(0,14)+'...');
-    // Redirect iframe to HandyPay (window.open blocked in GHL iframe sandbox)
-    dlog('\u27a1 Redirecting to HandyPay...');
-    ss('\u27a1 Opening HandyPay...');
-    location.href = d.checkoutUrl;
+    // Open HandyPay in a new tab.
+    // This MUST be called from a direct button click (user gesture) so the
+    // browser allows window.open(). GHL iframe has no sandbox restrictions.
+    var w=window.open(d.checkoutUrl,'_blank');
+    if(!w){
+      // Popup blocked - show message and let user retry by clicking the button
+      dlog('\u26a0 Popup blocked');
+      ss('\u26a0 Allow popups for this site, then click the button again.');
+      $el('b').disabled=false;done=false;return;
+    }
+    ss('\u23f3 HandyPay open. Complete payment and return here.');
+    dlog('\u2705 Tab opened: '+SID.substring(0,14)+'...');
+    // Poll every 3s for payment completion
+    poll=setInterval(function(){
+      if(!SID)return;
+      fetch('/api/query?paymentIntentId='+SID).then(function(r){return r.json();}).then(function(qd){
+        if(qd.success===true)confirmPayment();
+        else if(qd.failed===true){clearInterval(poll);ss('Payment failed. Try again.');done=false;$el('b').disabled=false;}
+      }).catch(function(){});
+    },3000);
   }).catch(function(e){dlog('\u274c '+e.message);ss('Error');$el('b').disabled=false;done=false;});
 }
 (function init(){
