@@ -4,8 +4,9 @@
 // Fixes vs server.js version:
 //   - Accepts currency param -> live currency passed to HandyPay (no hardcoded 'jmd')
 //   - Accepts paymentChoice ('deposit'|'full') -> stored as payment_type in DB
-//   - Session deduplication: reuse existing pending session within 2 hours
-//   - Pool config: max:2, idleTimeoutMillis:10000
+//   - Session deduplication: by ghl_transaction_id (order ID) first, fall back to amount
+//     Prevents two customers paying the same service price from sharing a session
+//   - Pool config: max:3, idleTimeoutMillis:10000
 //   - Unwrap HandyPay .data envelope: response is {success,data:{id,url}} not {id,url}
 //   - Friendly error for HandyPay 'too many sessions' rate limit
 'use strict';
@@ -14,7 +15,7 @@ const { Pool } = require('pg');
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  max: 2,
+  max: 3,
   idleTimeoutMillis: 10000,
   connectionTimeoutMillis: 5000
 });
@@ -29,7 +30,6 @@ async function getMerchantConfig(locationId) {
 
 async function createHandyPaySession(apiKey, amountJMD, label, meta, passFeesToCustomer, currency) {
   var cur = (currency || 'jmd').toLowerCase();
-  // Whitelist supported currencies; fall back to jmd
   if (!['jmd','usd','ttd','bbd','bsd','gyd','kyd'].includes(cur)) cur = 'jmd';
 
   var payload = {
@@ -53,7 +53,6 @@ async function createHandyPaySession(apiKey, amountJMD, label, meta, passFeesToC
     try { errBody = await r.json(); } catch(e) {}
     var errMsg = JSON.stringify(errBody).toLowerCase();
 
-    // HandyPay rate-limits open sessions — give a clear, actionable message
     if (r.status === 429 || errMsg.includes('too many') || errMsg.includes('session limit')) {
       throw new Error('too_many_sessions: An open payment session already exists. Please wait a few minutes and try again.');
     }
@@ -63,7 +62,6 @@ async function createHandyPaySession(apiKey, amountJMD, label, meta, passFeesToC
 
   var d = await r.json();
   // HandyPay wraps session in { success: true, data: { id, url } }
-  // Fall back to top-level for any future API change
   var obj = d.data || d;
   var id  = obj.id || obj.sessionId || obj.session_id || '';
   var url = obj.url || obj.checkoutUrl || obj.checkout_url || '';
@@ -83,9 +81,9 @@ module.exports = async function handler(req, res) {
   var currency         = (body.currency         || 'JMD').toUpperCase();
   var description      = body.description       || 'HandyPay Payment';
   var entityId         = body.entityId          || body.orderId || '';
-  var ghlTransactionId = body.ghlTransactionId  || body.transactionId || '';
+  var ghlTransactionId = body.ghlTransactionId  || body.transactionId || entityId || '';
   var paymentType      = body.paymentType        || 'calendar';
-  var paymentChoice    = body.paymentChoice      || 'deposit'; // 'deposit' | 'full'
+  var paymentChoice    = body.paymentChoice      || 'deposit';
 
   if (!locationId)      return res.status(400).json({ error: 'locationId required' });
   if (amountJMD < 80)  return res.status(400).json({ error: 'Amount too low (min J$80)' });
@@ -97,33 +95,51 @@ module.exports = async function handler(req, res) {
     }
 
     // ── SESSION DEDUPLICATION ────────────────────────────────────────────────
-    // Reuse an existing pending session for the same location + amount created
-    // within the last 2 hours. Prevents duplicate checkout sessions when the
-    // GHL iframe reloads (back button, refresh, slow network, or pre-fix retries
-    // that created sessions on HandyPay but errored before DB insert).
+    // Priority 1: dedup by GHL order/transaction ID (unique per booking).
+    //   Prevents the same booking from creating multiple HandyPay sessions
+    //   on retries, even across different amounts.
+    // Priority 2: dedup by amount (fallback when no order ID is available,
+    //   e.g. invoice flow). Two different customers with the same service
+    //   price could theoretically collide, but only within 2 hours.
     try {
-      var existing = await pool.query(
-        `SELECT session_id, checkout_url FROM payment_logs
-         WHERE location_id = $1
-           AND status = 'pending'
-           AND amount = $2
-           AND created_at > NOW() - INTERVAL '2 hours'
-         ORDER BY created_at DESC
-         LIMIT 1`,
-        [locationId, amountJMD]
-      );
-      if (existing.rows.length > 0 && existing.rows[0].checkout_url) {
-        var ex = existing.rows[0];
-        console.log('[create-session] reusing existing session:', ex.session_id);
+      var dedupRow = null;
+
+      if (ghlTransactionId) {
+        var r1 = await pool.query(
+          `SELECT session_id, checkout_url FROM payment_logs
+           WHERE location_id = $1
+             AND status = 'pending'
+             AND ghl_transaction_id = $2
+             AND created_at > NOW() - INTERVAL '2 hours'
+           ORDER BY created_at DESC LIMIT 1`,
+          [locationId, ghlTransactionId]
+        );
+        dedupRow = r1.rows[0] || null;
+      }
+
+      if (!dedupRow) {
+        var r2 = await pool.query(
+          `SELECT session_id, checkout_url FROM payment_logs
+           WHERE location_id = $1
+             AND status = 'pending'
+             AND amount = $2
+             AND created_at > NOW() - INTERVAL '2 hours'
+           ORDER BY created_at DESC LIMIT 1`,
+          [locationId, amountJMD]
+        );
+        dedupRow = r2.rows[0] || null;
+      }
+
+      if (dedupRow && dedupRow.checkout_url) {
+        console.log('[create-session] reusing existing session:', dedupRow.session_id);
         return res.json({
-          paymentIntentId: ex.session_id,
-          sessionId:       ex.session_id,
-          checkoutUrl:     ex.checkout_url,
+          paymentIntentId: dedupRow.session_id,
+          sessionId:       dedupRow.session_id,
+          checkoutUrl:     dedupRow.checkout_url,
           reused:          true
         });
       }
     } catch (dedupErr) {
-      // Non-fatal: dedup failed, fall through to create new session
       console.warn('[create-session] dedup check error (non-fatal):', dedupErr.message);
     }
 
@@ -133,7 +149,7 @@ module.exports = async function handler(req, res) {
       entityId,
       ghlTransactionId,
       paymentType,
-      paymentChoice, // webhook reads this to apply correct tag
+      paymentChoice,
       inv: entityId || ghlTransactionId || ''
     };
 
@@ -142,15 +158,10 @@ module.exports = async function handler(req, res) {
       amountJMD,
       description,
       meta,
-      true,     // pass_fees_to_customer
-      currency  // live currency from GHL order
+      true,
+      currency
     );
 
-    // ── DETERMINE DB PAYMENT TYPE ────────────────────────────────────────────
-    // Maps to the tag that will be applied on the contact after payment:
-    //   'ghl_native' -> no tag (GHL handles invoice confirmation)
-    //   'full'       -> 'full-payment-paid' tag
-    //   'deposit'    -> 'deposit-paid' tag (default)
     var dbPaymentType = paymentType === 'ghl_native' ? 'ghl_native'
       : paymentChoice === 'full' ? 'full'
       : 'deposit';
@@ -173,11 +184,11 @@ module.exports = async function handler(req, res) {
         ]
       );
     } catch (logErr) {
-      // Non-fatal: DB insert failed but session exists — client can still pay
       console.error('[create-session] payment_logs insert failed:', logErr.message);
     }
 
-    console.log('[create-session] ✅ session=%s amt=%s cur=%s choice=%s', session.id, amountJMD, currency, paymentChoice);
+    console.log('[create-session] ✅ session=%s amt=%s cur=%s choice=%s txn=%s',
+      session.id, amountJMD, currency, paymentChoice, ghlTransactionId);
 
     return res.json({
       paymentIntentId: session.id,
@@ -187,7 +198,6 @@ module.exports = async function handler(req, res) {
 
   } catch (e) {
     console.error('[create-session] error:', e.message);
-    // Surface friendly message for rate-limit errors
     var userMsg = e.message && e.message.startsWith('too_many_sessions:')
       ? 'An open payment session already exists. Please wait a few minutes and try again.'
       : (e.message || 'Failed to create payment session');
