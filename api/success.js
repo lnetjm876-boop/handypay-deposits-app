@@ -2,6 +2,8 @@
 // Handles HandyPay post-payment redirect: /success?session_id=...
 // FIX: only fires record-payment for ghl_native sessions
 //      deposit/full sessions get tag+note on contact ONLY (no invoice to mark)
+// FIX 2: Added frame-ancestors * CSP so this page loads inside GHL iframe after redirect.
+//        Sends custom_element_success_response directly (api/pay listener is gone after redirect).
 'use strict';
 
 const { Pool } = require('pg');
@@ -44,7 +46,7 @@ async function refreshCrmToken(locationId) {
   if (!r.ok) throw new Error('Token refresh ' + r.status);
   const data = await r.json();
   await pool.query(
-    'UPDATE merchant_configs SET crm_access_token=$1,crm_refresh_token=$2,ghl_access_token=$1,ghl_refresh_token=$2,updated_at=NOW() WHERE location_id=$3',
+    'UPDATE merchant_configs SET crm_access_token=$1,crm_refresh_token=$2,updated_at=NOW() WHERE location_id=$3',
     [data.access_token, data.refresh_token, locationId]
   );
   return data.access_token;
@@ -139,7 +141,7 @@ module.exports = async function handler(req, res) {
               console.log('[success] ghl_native: no invId for session', sessionId);
             }
           } else {
-            // DEPOSIT / FULL FLOW: tag + note on contact
+            // DEPOSIT / FULL / CALENDAR FLOW: tag + note on contact
             // NO record-payment call — deposits are standalone, not tied to a GHL invoice
             if (sLog.contact_id) {
               await addContactTag(tok, sLog.contact_id, ['deposit-paid'])
@@ -155,8 +157,32 @@ module.exports = async function handler(req, res) {
     }
   }
 
-  // Respond with confirmation page + postMessage to GHL iframe parent
-  var sid = JSON.stringify(sessionId);
+  // Allow loading inside GHL iframe after location.href redirect
+  res.setHeader('Content-Security-Policy', "frame-ancestors *");
+  res.setHeader('X-Frame-Options', 'ALLOWALL');
   res.setHeader('Content-Type', 'text/html');
-  res.end('<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Payment Confirmed</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f0fdf4;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}.card{background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(0,0,0,.08);max-width:420px;width:100%;padding:40px;text-align:center}.icon{font-size:64px;margin-bottom:16px}h1{font-size:22px;font-weight:800;color:#15803d;margin-bottom:10px}p{font-size:15px;color:#555;line-height:1.6}.sub{font-size:13px;color:#888;margin-top:20px}</style></head><body><div class="card"><div class="icon">&#x2705;</div><h1>Payment Confirmed!</h1><p>Thank you. Your payment was received successfully.</p><p class="sub">You may close this window.</p></div><script>var s=' + sid + ';if(s){try{window.parent.postMessage({type:"PAYMENT_SUCCESS",paymentIntentId:s,status:"succeeded"},"*");window.parent.postMessage({event:"payment-success",paymentIntentId:s},"*");if(window.opener){window.opener.postMessage({type:"PAYMENT_SUCCESS",paymentIntentId:s,status:"succeeded"},"*");setTimeout(function(){try{window.close();}catch(e){}},2000);}window.parent.postMessage({success:true,paymentIntentId:s,orderId:s},"*");}catch(e){}}setTimeout(function(){try{window.parent.postMessage({type:"PAYMENT_COMPLETE",paymentIntentId:s},"*");}catch(e){}},2000);<\/script></body></html>');
+
+  // Respond with confirmation page + postMessage to GHL iframe parent
+  // IMPORTANT: api/pay.js is gone after the redirect, so we send
+  // custom_element_success_response directly from here.
+  var sid = JSON.stringify(sessionId);
+  var scriptContent = 'var s=' + sid + ';' +
+    'if(s){try{' +
+    // GHL custom payment provider required success signal
+    'window.parent.postMessage(JSON.stringify({type:"custom_element_success_response",chargeId:s}),"*");' +
+    'window.parent.postMessage({type:"custom_element_success_response",chargeId:s},"*");' +
+    // Legacy / fallback signals
+    'window.parent.postMessage({type:"PAYMENT_SUCCESS",paymentIntentId:s,status:"succeeded"},"*");' +
+    'window.parent.postMessage({event:"payment-success",paymentIntentId:s},"*");' +
+    'if(window.opener){window.opener.postMessage({type:"PAYMENT_SUCCESS",paymentIntentId:s,status:"succeeded"},"*");setTimeout(function(){try{window.close();}catch(e){}},2000);}' +
+    'window.parent.postMessage({success:true,paymentIntentId:s,orderId:s},"*");' +
+    '}catch(e){}}' +
+    'setTimeout(function(){try{' +
+    // GHL close signal
+    'window.parent.postMessage(JSON.stringify({type:"custom_element_close_response"}),"*");' +
+    'window.parent.postMessage({type:"custom_element_close_response"},"*");' +
+    'window.parent.postMessage({type:"PAYMENT_COMPLETE",paymentIntentId:s},"*");' +
+    '}catch(e){}},1500);';
+
+  res.end('<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Payment Confirmed</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f0fdf4;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}.card{background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(0,0,0,.08);max-width:420px;width:100%;padding:40px;text-align:center}.icon{font-size:64px;margin-bottom:16px}h1{font-size:22px;font-weight:800;color:#15803d;margin-bottom:10px}p{font-size:15px;color:#555;line-height:1.6}.sub{font-size:13px;color:#888;margin-top:20px}</style></head><body><div class="card"><div class="icon">&#x2705;</div><h1>Payment Confirmed!</h1><p>Thank you. Your payment was received successfully.</p><p class="sub">You may close this window.</p></div><script>' + scriptContent + '<\/script></body></html>');
 };

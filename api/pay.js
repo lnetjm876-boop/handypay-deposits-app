@@ -7,6 +7,10 @@
 //   - After refresh, fetch pending calendar order, get deposit amount from public API.
 //   - Embed amount in page JS. Client auto-triggers after 1s.
 //   - Still listens for payment_initiate_props (invoice flow fallback).
+//
+// FIX 2: window.open() is blocked inside GHL iframe sandbox (no allow-popups).
+//   Use location.href redirect instead. After payment, HandyPay redirects to
+//   /api/success which loads in the same iframe and sends custom_element_success_response.
 'use strict';
 
 const { Pool } = require('pg');
@@ -204,7 +208,7 @@ function confirmPayment(){
 }
 function openHP(){
   if(done)return;done=true;
-  $el('b').disabled=true;ss('Opening HandyPay...');
+  $el('b').disabled=true;ss('Connecting to HandyPay...');
   dlog('\u1f680 J$'+Math.round(AMT));
   fetch('/api/create-native-session',{
     method:'POST',headers:{'Content-Type':'application/json'},
@@ -218,16 +222,10 @@ function openHP(){
     }
     SID=d.sessionId||d.paymentIntentId||'';
     dlog('\u23f3 '+SID.substring(0,14)+'...');
-    var w=window.open(d.checkoutUrl,'_blank');
-    if(!w){ss('Popup blocked \u2014 allow popups');$el('b').disabled=false;done=false;return;}
-    ss('\u23f3 HandyPay open in new tab. Return here after paying.');
-    poll=setInterval(function(){
-      if(!SID)return;
-      fetch('/api/query?paymentIntentId='+SID).then(function(r){return r.json();}).then(function(qd){
-        if(qd.success===true)confirmPayment();
-        else if(qd.failed===true){clearInterval(poll);ss('Failed. Try again.');done=false;$el('b').disabled=false;}
-      }).catch(function(){});
-    },3000);
+    // Redirect iframe to HandyPay (window.open blocked in GHL iframe sandbox)
+    dlog('\u27a1 Redirecting to HandyPay...');
+    ss('\u27a1 Opening HandyPay...');
+    location.href = d.checkoutUrl;
   }).catch(function(e){dlog('\u274c '+e.message);ss('Error');$el('b').disabled=false;done=false;});
 }
 (function init(){
