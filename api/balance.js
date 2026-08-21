@@ -1,15 +1,20 @@
 // api/balance.js — Remaining Balance Collection Page
 //
-// URL: GET /api/balance?locationId=XXX&orderId=YYY
+// Supports two URL patterns:
+//   GET /api/balance?locationId=XXX&orderId=YYY        (direct order link)
+//   GET /api/balance?locationId=XXX&contactId=ZZZ      (GHL workflow-friendly)
+//
+// When contactId is supplied, the server fetches the most recent
+// partially-paid calendar order for that contact using the location’s CRM token.
+// This lets GHL Appointment Reminder workflows use:
+//   {{location.id}} and {{contact.id}} as merge fields — no custom fields needed.
 //
 // Flow:
-//   1. Fetch GHL order (public endpoint, no token needed)
-//   2. Look up deposit already paid in payment_logs by ghl_transaction_id
-//   3. Calculate remaining = total - deposit_paid
-//   4. Show "Pay Remaining: J$X" button via HandyPay
-//   5. Webhook fires -> tags contact full-payment-paid
-//
-// Used by GHL Workflow: Appointment Reminder -> send balance link to client
+//   1. Resolve GHL order → total amount + service name
+//   2. Sum deposits already paid in payment_logs by ghl_transaction_id
+//   3. Remaining = total − paid
+//   4. Show “Pay Remaining Balance” button → HandyPay checkout
+//   5. Webhook fires → tags contact full-payment-paid
 'use strict';
 
 const { Pool } = require('pg');
@@ -21,6 +26,7 @@ const pool = new Pool({
   connectionTimeoutMillis: 5000
 });
 
+const GHL_API = 'https://services.leadconnectorhq.com';
 const APP_URL = process.env.APP_URL || 'https://handypay-deposits-app.vercel.app';
 
 async function fetchWithTimeout(url, opts, ms) {
@@ -38,7 +44,6 @@ async function getMerchantConfig(locationId) {
   return rows[0] || null;
 }
 
-// Get deposit(s) already paid for this order from payment_logs
 async function getPaidDeposit(locationId, orderId) {
   try {
     const { rows } = await pool.query(
@@ -57,6 +62,46 @@ async function getPaidDeposit(locationId, orderId) {
   }
 }
 
+// Fetch GHL order via public (no auth) endpoint
+async function fetchPublicOrder(orderId) {
+  try {
+    const r = await fetchWithTimeout(
+      'https://backend.leadconnectorhq.com/payments/orders/public/' + orderId, {}, 3000
+    );
+    if (!r.ok) return null;
+    return await r.json();
+  } catch(e) { return null; }
+}
+
+// Fetch most recent partially-paid calendar order for a contact (requires CRM token)
+async function fetchOrderByContact(locationId, contactId, token) {
+  try {
+    // Try partially_paid first, then fall back to any unpaid
+    const urls = [
+      GHL_API + '/payments/orders?altId=' + encodeURIComponent(locationId)
+        + '&altType=location&contactId=' + encodeURIComponent(contactId)
+        + '&paymentStatus=partially_paid&limit=5',
+      GHL_API + '/payments/orders?altId=' + encodeURIComponent(locationId)
+        + '&altType=location&contactId=' + encodeURIComponent(contactId)
+        + '&paymentStatus=unpaid&limit=5',
+    ];
+    for (const url of urls) {
+      const r = await fetchWithTimeout(url, {
+        headers: { 'Authorization': 'Bearer ' + token, 'Version': '2021-07-28' }
+      }, 3000);
+      if (!r.ok) continue;
+      const d = await r.json();
+      const orders = d.data || d.orders || [];
+      // Prefer calendar orders, newest first
+      const sorted = orders
+        .filter(o => o.sourceType === 'calendar' || (o.source && o.source.type === 'calendar'))
+        .sort((a, b) => (b._id > a._id ? 1 : -1));
+      if (sorted.length > 0) return sorted[0];
+    }
+  } catch(e) { console.error('[balance] fetchOrderByContact:', e.message); }
+  return null;
+}
+
 module.exports = async function handler(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'GET only' });
 
@@ -67,58 +112,61 @@ module.exports = async function handler(req, res) {
   const q          = req.query || {};
   const locationId = q.locationId || '';
   const orderId    = q.orderId    || '';
+  const contactId  = q.contactId  || '';
 
-  // ── Validate ──────────────────────────────────────────────────────────────────────
-  if (!locationId || !orderId) {
-    return res.end(errorPage('Missing locationId or orderId in the link. Please contact the business for a valid payment link.'));
+  if (!locationId || (!orderId && !contactId)) {
+    return res.end(errorPage('Invalid payment link. Please contact the business.'));
   }
 
-  // ── Fetch GHL order (unauthenticated public endpoint) ────────────────────────
-  let totalAmt = 0, currency = 'JMD', serviceName = 'Service', contactId = '';
-  try {
-    const pr = await fetchWithTimeout(
-      'https://backend.leadconnectorhq.com/payments/orders/public/' + orderId, {}, 3000
-    );
-    if (pr.ok) {
-      const pd   = await pr.json();
-      totalAmt   = pd.amount || 0;
-      currency   = (pd.currency || 'JMD').toUpperCase();
-      serviceName = (pd.source && pd.source.name) || 'Service';
-      contactId  = pd.contactId || pd.contact_id || '';
-      console.log('[balance] order total:', totalAmt, currency, 'service:', serviceName);
-    } else {
-      console.error('[balance] public order fetch', pr.status);
-    }
-  } catch(e) {
-    console.error('[balance] public order error:', e.message);
+  const cfg   = await getMerchantConfig(locationId).catch(() => null);
+  const token = (cfg && cfg.crm_access_token) || '';
+  const hasKey = !!(cfg && cfg.handypay_api_key);
+
+  // ── Resolve the GHL order ─────────────────────────────────────────────────────
+  let order = null;
+
+  if (orderId) {
+    // Direct order ID — use public endpoint (no auth needed)
+    order = await fetchPublicOrder(orderId);
+  } else if (contactId && token) {
+    // contactId from GHL workflow merge field — fetch via authenticated API
+    order = await fetchOrderByContact(locationId, contactId, token);
+  } else if (contactId && !token) {
+    return res.end(errorPage('Payment provider not configured for this account.'));
   }
+
+  if (!order) {
+    return res.end(errorPage('No outstanding balance found. Your booking may already be paid in full.'));
+  }
+
+  const resolvedOrderId = order._id || orderId;
+  const totalAmt   = order.amount || 0;
+  const currency   = (order.currency || 'JMD').toUpperCase();
+  const serviceName = (order.source && order.source.name) || (order.sourceName) || 'Service';
+  const resolvedContactId = order.contactId || order.contact_id || contactId || '';
 
   if (!totalAmt) {
-    return res.end(errorPage('Could not load order details. Please contact the business.'));
+    return res.end(errorPage('Could not read order amount. Please contact the business.'));
   }
 
-  // ── Calculate remaining balance ───────────────────────────────────────────────
-  const depositPaid = await getPaidDeposit(locationId, orderId);
+  // ── Calculate remaining ────────────────────────────────────────────────────────
+  const depositPaid = await getPaidDeposit(locationId, resolvedOrderId);
   const remaining   = Math.max(0, totalAmt - depositPaid);
-  console.log('[balance] total:', totalAmt, 'paid:', depositPaid, 'remaining:', remaining);
+  console.log('[balance] order:', resolvedOrderId, 'total:', totalAmt, 'paid:', depositPaid, 'remaining:', remaining, currency);
 
   if (remaining <= 0) {
     return res.end(paidPage(serviceName, currency));
   }
 
-  // ── Check HandyPay API key configured ────────────────────────────────────────
-  const cfg = await getMerchantConfig(locationId).catch(() => null);
-  const hasKey = !!(cfg && cfg.handypay_api_key);
-
-  // Inject template variables into client JS
+  // Template vars
   const L   = JSON.stringify(locationId);
-  const ORD = JSON.stringify(orderId);
+  const ORD = JSON.stringify(resolvedOrderId);
   const REM = JSON.stringify(remaining);
   const DEP = JSON.stringify(depositPaid);
   const TOT = JSON.stringify(totalAmt);
   const CUR = JSON.stringify(currency);
   const SVC = JSON.stringify(serviceName);
-  const CID = JSON.stringify(contactId);
+  const CID = JSON.stringify(resolvedContactId);
   const HAS = JSON.stringify(hasKey);
 
   const clientJS = `
@@ -127,67 +175,48 @@ var done=false,confirmed=false,SID='';
 
 function $el(id){return document.getElementById(id);}
 function ss(t){var el=$el('st');if(el)el.textContent=t;}
-
 function fmt(amt,cur){
   var sym=(cur==='USD')?'US$':(cur==='JMD'?'J$':cur+' ');
   return sym+Number(Math.round(amt)).toLocaleString();
 }
-
 function init(){
   $el('svc-name').textContent=SVC;
   $el('rem-amt').textContent=fmt(REM,CUR);
   $el('dep-amt').textContent=fmt(DEP,CUR);
   $el('tot-amt').textContent=fmt(TOT,CUR);
-  if(!HAS){
-    ss('Payment not configured. Please contact the business.');
-    $el('pay-btn').disabled=true;
-  } else {
-    ss('Tap to pay your remaining balance and confirm your booking.');
-  }
+  if(!HAS){ss('Payment not configured. Please contact the business.');$el('pay-btn').disabled=true;}
+  else{ss('Secure your booking by paying the remaining balance.');}
 }
-
 function confirmPayment(){
   if(confirmed)return;confirmed=true;
   ss('\u2705 Balance paid! Your booking is fully confirmed.');
-  // Notify parent if in iframe
   try{
     window.parent.postMessage(JSON.stringify({type:'custom_element_success_response',chargeId:SID}),'*');
     window.parent.postMessage({type:'custom_element_success_response',chargeId:SID},'*');
   }catch(e){}
-  // Poll stops
   if(window._poll)clearInterval(window._poll);
 }
-
 function payBalance(){
   if(done||!HAS)return;
   done=true;
-
-  // iOS Safari: open blank tab synchronously
   var w=window.open('','_blank');
   $el('pay-btn').disabled=true;
   ss('Opening HandyPay...');
-
   fetch('/api/create-native-session',{
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({
-      locationId:L,
-      amountJMD:REM,
-      currency:CUR,
+      locationId:L,amountJMD:REM,currency:CUR,
       description:'Balance: '+SVC,
-      entityId:ORD,
-      ghlTransactionId:ORD,
-      contactId:CID,
-      paymentType:'balance',
-      paymentChoice:'full'
+      entityId:ORD,ghlTransactionId:ORD,contactId:CID,
+      paymentType:'balance',paymentChoice:'full'
     })
   }).then(function(r){return r.json();})
   .then(function(d){
     if(!d.checkoutUrl){
       if(w)try{w.close();}catch(e){}
-      ss('Error: '+(d.error||'Could not open checkout. Please try again.'));
-      $el('pay-btn').disabled=false;
-      done=false;return;
+      ss('Error: '+(d.error||'Could not open checkout. Try again.'));
+      $el('pay-btn').disabled=false;done=false;return;
     }
     SID=d.sessionId||d.paymentIntentId||'';
     if(w&&!w.closed){w.location.href=d.checkoutUrl;}
@@ -204,20 +233,17 @@ function payBalance(){
           if(qd.success===true)confirmPayment();
           else if(qd.failed===true){
             clearInterval(window._poll);
-            ss('Payment was not completed. Please try again.');
-            $el('pay-btn').disabled=false;
-            done=false;
+            ss('Payment not completed. Please try again.');
+            $el('pay-btn').disabled=false;done=false;
           }
         }).catch(function(){});
     },3000);
   }).catch(function(){
     if(w)try{w.close();}catch(e){}
     ss('Connection error. Please try again.');
-    $el('pay-btn').disabled=false;
-    done=false;
+    $el('pay-btn').disabled=false;done=false;
   });
 }
-
 window.addEventListener('load',init);
 `;
 
@@ -235,7 +261,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .row.total{font-weight:700;color:#1a1a1a;border-top:1px solid #e2e8f0;padding-top:8px;margin-top:4px}
 .row.paid{color:#15803d}
 .row.due{color:#b45309;font-size:15px;font-weight:800}
-.rem-big{font-size:30px;font-weight:900;color:#15803d;margin-bottom:8px}
 .btn{background:#15803d;color:#fff;border:none;border-radius:10px;padding:14px 24px;
   font-size:15px;font-weight:700;cursor:pointer;width:100%;font-family:inherit;margin-bottom:12px}
 .btn:disabled{opacity:.6;cursor:not-allowed}
@@ -244,7 +269,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 
   const html = `<!DOCTYPE html><html><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Pay Remaining Balance</title>
+<title>Pay Remaining Balance — HandyPay</title>
 <style>${css}</style>
 </head><body><div class="card">
 <div class="logo">&#x1F4B3;</div>
@@ -264,8 +289,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 };
 
 function errorPage(msg) {
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Payment Error</title>
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Payment Error</title>
 <style>body{font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;
 min-height:100vh;background:#fff8f8;padding:20px}
 .box{background:#fff;border-radius:12px;padding:28px;max-width:380px;text-align:center;
@@ -277,8 +302,8 @@ p{color:#555;font-size:14px;line-height:1.5}</style></head>
 }
 
 function paidPage(serviceName, currency) {
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Already Paid</title>
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Already Paid</title>
 <style>body{font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;
 min-height:100vh;background:#f0fdf4;padding:20px}
 .box{background:#fff;border-radius:12px;padding:28px;max-width:380px;text-align:center;
@@ -288,6 +313,6 @@ h2{color:#15803d;font-size:20px;margin-bottom:8px}
 p{color:#555;font-size:14px;line-height:1.5}</style></head>
 <body><div class="box"><div class="icon">✅</div>
 <h2>All Paid!</h2>
-<p>The full balance for <strong>${serviceName}</strong> has already been received. No further payment is needed.</p>
+<p>The full balance for <strong>${serviceName}</strong> has been received. No further payment is needed. See you at your appointment!</p>
 </div></body></html>`;
 }
