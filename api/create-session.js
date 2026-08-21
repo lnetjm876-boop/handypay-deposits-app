@@ -6,6 +6,7 @@
 //   - Accepts paymentChoice ('deposit'|'full') -> stored as payment_type in DB
 //   - Session deduplication: reuse existing pending session within 30 min
 //   - Pool config: max:2, idleTimeoutMillis:10000
+//   - Unwrap HandyPay .data envelope: response is {success,data:{id,url}} not {id,url}
 'use strict';
 
 const { Pool } = require('pg');
@@ -52,8 +53,11 @@ async function createHandyPaySession(apiKey, amountJMD, label, meta, passFeesToC
   }
 
   var d = await r.json();
-  var id  = d.id || d.sessionId || d.session_id || '';
-  var url = d.url || d.checkoutUrl || d.checkout_url || '';
+  // HandyPay wraps session in { success: true, data: { id, url } }
+  // Fall back to top-level for any future API change
+  var obj = d.data || d;
+  var id  = obj.id || obj.sessionId || obj.session_id || '';
+  var url = obj.url || obj.checkoutUrl || obj.checkout_url || '';
   if (!id || !url) throw new Error('HandyPay returned empty id/url: ' + JSON.stringify(d).substring(0,120));
   return { id, url };
 }
