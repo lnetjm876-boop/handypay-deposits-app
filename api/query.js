@@ -1,20 +1,15 @@
 // api/query.js — GHL Custom Payment Provider — All query types
+// v2: uses lib/db + lib/token shared modules
 // Handles: list_payment_methods, charge_payment, create_subscription,
 //          cancel_subscription, refund, verify, GET status poll
 // Routed by vercel.json BEFORE the server.js catch-all.
 // FIX: verify handler only fires record-payment for ghl_native sessions
 
-const { Pool } = require('pg');
+const pool            = require('../lib/db');
+const { getFreshToken } = require('../lib/token');
 
 const GHL_API = 'https://services.leadconnectorhq.com';
-const GHL_CLIENT_ID = process.env.GHL_CLIENT_ID;
-const GHL_CLIENT_SECRET = process.env.GHL_CLIENT_SECRET;
 const HP_BASE = 'https://api.handypay.me/api/v1';
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
 
 // Parse request body (Vercel does NOT auto-parse JSON for serverless functions)
 async function parseBody(req) {
@@ -40,36 +35,6 @@ async function getPaymentLog(chargeId) {
 async function getPaymentLogByTx(txId) {
   const r = await pool.query('SELECT * FROM payment_logs WHERE ghl_transaction_id=$1', [txId]);
   return r.rows[0] || null;
-}
-
-// Token helpers
-async function refreshCrmToken(locationId) {
-  const cfg = await getMerchantConfig(locationId);
-  const refreshTok = (cfg && (cfg.crm_refresh_token || cfg.ghl_refresh_token)) || '';
-  if (!refreshTok) throw new Error('No refresh token for ' + locationId);
-  const r = await fetch(GHL_API + '/oauth/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      client_id: GHL_CLIENT_ID, client_secret: GHL_CLIENT_SECRET,
-      grant_type: 'refresh_token', refresh_token: refreshTok
-    })
-  });
-  if (!r.ok) throw new Error('Token refresh HTTP ' + r.status);
-  const data = await r.json();
-  await pool.query(
-    'UPDATE merchant_configs SET crm_access_token=$1,crm_refresh_token=$2,ghl_access_token=$1,ghl_refresh_token=$2,updated_at=NOW() WHERE location_id=$3',
-    [data.access_token, data.refresh_token, locationId]
-  );
-  return data.access_token;
-}
-async function getFreshToken(locationId) {
-  const cfg = await getMerchantConfig(locationId).catch(function() { return null; });
-  if (!cfg) return '';
-  let tok = cfg.crm_access_token || cfg.ghl_access_token || '';
-  if (!cfg.crm_refresh_token && !cfg.ghl_refresh_token) return tok; // PIT mode
-  try { const fresh = await refreshCrmToken(locationId); if (fresh) tok = fresh; } catch (e) {}
-  return tok;
 }
 
 // Invoice helpers
@@ -178,11 +143,11 @@ module.exports = async function handler(req, res) {
 
       if (log && (log.status === 'paid' || log.status === 'completed')) {
         // FIX: only fire record-payment for ghl_native sessions
-        // deposit/full sessions use tag+note — they have no GHL invoice to mark
+        // deposit/full sessions are handled by GHL Workflow 2 (no invoice to mark)
         if (log.location_id && !log.record_payment_done && log.payment_type === 'ghl_native') {
           (async function() {
             try {
-              const qTok = await getFreshToken(log.location_id);
+              const qTok = await getFreshToken(log.location_id).catch(function() { return ''; });
               if (!qTok) return;
               let invId = log.entity_id || '';
               if (!invId && log.ghl_transaction_id) invId = await getInvoiceIdByTx(log.location_id, log.ghl_transaction_id, qTok);
