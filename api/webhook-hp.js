@@ -1,239 +1,244 @@
-// api/webhook-hp.js
-// Overrides /api/webhooks/handypay route from server.js catch-all.
-//
-// Fixes vs server.js version:
-//   - IDEMPOTENCY: skips if session already status='paid'
-//   - CORRECT TAGGING: 'deposit-paid' OR 'full-payment-paid' based on paymentChoice
-//   - AWAIT tag+note before responding (prevents Vercel fire-and-forget kill)
-//   - CONFIG FIX: handler.config attached after defining handler
-//   - CONTACT LOOKUP: if contactId not in metadata, fetches GHL order by entityId.
-//     GHL /payments/orders/:id REQUIRES ?altId={locationId}&altType=location query params.
-//   - Pool config: max:3
+// api/webhook-hp.js — HandyPay payment webhook handler v3
+// ARCHITECTURE SHIFT: app no longer adds tags/notes directly.
+// After confirming payment the app writes to 2 contact custom fields:
+//   deposit_status      → "paid"   (triggers GHL Workflow "Deposit Confirmed")
+//   deposit_amount_paid → amount   (used in GHL workflow note text)
+// GHL Workflow handles: add tag, add note, send confirmation SMS, start upsell sequence.
+// This keeps all CRM communication logic in GHL where it can be edited without deploys.
 'use strict';
-
-const crypto = require('crypto');
 const { Pool } = require('pg');
+
+const GHL_API   = 'https://services.leadconnectorhq.com';
+const HP_BASE   = 'https://api.handypay.me/api/v1';
+const APP_URL   = process.env.APP_URL || 'https://handypay-deposits-app.vercel.app';
+
+// Custom field IDs (created 2026-08-25)
+const CF_DEPOSIT_STATUS = 'U5ZFR70chqhsm17CGyTZ';  // contact.deposit_status
+const CF_DEPOSIT_AMOUNT = 'SbbZbk7h0jF4p02SLssW';  // contact.deposit_amount_paid
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
   max: 3,
-  idleTimeoutMillis: 10000,
-  connectionTimeoutMillis: 5000
+  idleTimeoutMillis: 10000
 });
 
-const GHL_API = 'https://services.leadconnectorhq.com';
-
-// ── Helpers ──────────────────────────────────────────────────────────────────────
-async function getRawBody(req) {
-  return new Promise((resolve, reject) => {
-    var chunks = [];
-    req.on('data', function(chunk) { chunks.push(chunk); });
-    req.on('end',  function()      { resolve(Buffer.concat(chunks)); });
-    req.on('error', reject);
-  });
-}
-
-async function getMerchantConfig(locationId) {
+// ── DB helpers ──────────────────────────────────────────────
+async function getConfig(locationId) {
   const { rows } = await pool.query('SELECT * FROM merchant_configs WHERE location_id=$1', [locationId]);
   return rows[0] || null;
 }
 
-async function getPaymentLogBySession(sessionId) {
+async function getLogBySession(sessionId) {
   const { rows } = await pool.query('SELECT * FROM payment_logs WHERE session_id=$1', [sessionId]);
   return rows[0] || null;
 }
 
-async function updatePaymentLogStatus(sessionId, status) {
-  await pool.query('UPDATE payment_logs SET status=$1, updated_at=NOW() WHERE session_id=$2', [status, sessionId]);
-}
-
+// ── Token (PIT-first) ───────────────────────────────────────────────
 async function getFreshToken(locationId) {
-  var cfg = await getMerchantConfig(locationId).catch(function(){return null;});
-  if (!cfg) return '';
-  return cfg.crm_access_token || cfg.ghl_access_token || '';
-}
-
-async function addContactTag(accessToken, contactId, tags) {
-  var r = await fetch(GHL_API + '/contacts/' + contactId + '/tags', {
+  const { rows } = await pool.query(
+    'SELECT crm_access_token, crm_refresh_token FROM merchant_configs WHERE location_id=$1',
+    [locationId]
+  );
+  if (!rows[0]) throw new Error('no_config');
+  const cfg = rows[0];
+  if (!cfg.crm_refresh_token) return cfg.crm_access_token || '';   // PIT — never expires
+  // OAuth refresh
+  const r = await fetch(GHL_API + '/oauth/token', {
     method: 'POST',
-    headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
-    body: JSON.stringify({ tags: tags })
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      client_id:     process.env.GHL_CLIENT_ID,
+      client_secret: process.env.GHL_CLIENT_SECRET,
+      refresh_token: cfg.crm_refresh_token
+    })
   });
-  if (!r.ok) console.error('[webhook-hp] tag failed:', r.status);
-  return r.json().catch(function(){});
+  if (!r.ok) throw new Error('token_refresh_failed:' + r.status);
+  const d = await r.json();
+  await pool.query('UPDATE merchant_configs SET crm_access_token=$1,crm_refresh_token=$2,updated_at=NOW() WHERE location_id=$3',
+    [d.access_token, d.refresh_token, locationId]);
+  return d.access_token;
 }
 
-async function addContactNote(accessToken, contactId, body) {
-  var r = await fetch(GHL_API + '/contacts/' + contactId + '/notes', {
-    method: 'POST',
-    headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
-    body: JSON.stringify({ body: body })
+// ── GHL: update contact custom fields ──────────────────────────────────
+// Writes deposit_status + deposit_amount_paid → triggers GHL workflow
+async function updateContactFields(accessToken, contactId, fields) {
+  const customFields = Object.entries(fields).map(function([id, val]) {
+    return { id: id, value: String(val) };
   });
-  if (!r.ok) console.error('[webhook-hp] note failed:', r.status);
-  return r.json().catch(function(){});
+  const r = await fetch(GHL_API + '/contacts/' + contactId, {
+    method: 'PUT',
+    headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
+    body: JSON.stringify({ customFields: customFields })
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(function() { return ''; });
+    console.error('[updateContactFields]', r.status, t.slice(0, 200));
+  }
+  return r.json().catch(function() {});
 }
 
-// ── Look up contactId from a GHL order ────────────────────────────────────────
-// IMPORTANT: GHL GET /payments/orders/:id requires ?altId={locationId}&altType=location
-// Without these query params the endpoint returns 422.
+// ── GHL: look up contactId from GHL order (fallback for native sessions) ──────
 async function lookupContactId(accessToken, orderId, locationId) {
-  if (!accessToken || !orderId || !locationId) return '';
   try {
-    var url = GHL_API + '/payments/orders/' + orderId
-      + '?altId=' + encodeURIComponent(locationId) + '&altType=location';
-    var r = await fetch(url, {
+    const r = await fetch(GHL_API + '/payments/orders/' + orderId + '?altId=' + locationId + '&altType=location', {
       headers: { 'Authorization': 'Bearer ' + accessToken, 'Version': '2021-07-28' }
     });
-    if (!r.ok) {
-      console.warn('[webhook-hp] order lookup', r.status, 'orderId:', orderId, 'loc:', locationId);
-      return '';
+    if (!r.ok) return null;
+    const d = await r.json();
+    return (d.contactSnapshot && d.contactSnapshot.id) || (d.contact && d.contact.id) || null;
+  } catch(e) {
+    console.error('[lookupContactId]', e.message);
+    return null;
+  }
+}
+
+// ── GHL: mark GHL invoice as paid ────────────────────────────────────
+async function fireRecordPayment(invoiceId, locationId, amount, note, token) {
+  const r = await fetch(GHL_API + '/invoices/' + invoiceId + '/record-payment', {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
+    body: JSON.stringify({ locationId: locationId, amountDue: amount, notes: note || 'Paid via HandyPay' })
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(function() { return ''; });
+    throw new Error('record-payment ' + r.status + ': ' + t.slice(0, 200));
+  }
+  return r.json();
+}
+
+// ── Webhook signature verification ───────────────────────────────────────
+function verifySignature(secret, rawBody, sigHeader) {
+  if (!secret || !sigHeader) return true; // skip if not configured
+  const crypto = require('crypto');
+  const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+  return sigHeader === expected || sigHeader === 'sha256=' + expected;
+}
+
+// ── MAIN HANDLER ──────────────────────────────────────────────
+async function handler(req, res) {
+  // Collect raw body for signature verification
+  let rawBody = '';
+  if (typeof req.body === 'string') {
+    rawBody = req.body;
+  } else if (Buffer.isBuffer(req.body)) {
+    rawBody = req.body.toString('utf8');
+  } else {
+    rawBody = JSON.stringify(req.body || {});
+  }
+
+  let event;
+  try { event = JSON.parse(rawBody); } catch(e) { return res.status(400).json({ error: 'invalid_json' }); }
+
+  const sessionId = (event.data && event.data.id) || event.id || event.session_id;
+  const eventType = event.type || event.event;
+
+  console.log('[HP Webhook]', eventType, sessionId);
+
+  // ── Look up payment log ──
+  const sLog = sessionId ? await getLogBySession(sessionId) : null;
+  if (!sLog) {
+    console.warn('[HP Webhook] no payment_log for session', sessionId);
+    return res.json({ ok: false, error: 'session_not_found' });
+  }
+
+  const locationId = sLog.location_id;
+
+  // ── Signature check (per-account secret stored in merchant_configs) ──
+  const cfg = await getConfig(locationId);
+  if (cfg && cfg.handypay_webhook_secret) {
+    const sig = req.headers['x-handypay-signature'] || req.headers['x-hp-signature'] || '';
+    if (!verifySignature(cfg.handypay_webhook_secret, rawBody, sig)) {
+      console.error('[HP Webhook] signature mismatch for', locationId);
+      return res.status(401).json({ error: 'invalid_signature' });
     }
-    var d = await r.json();
-    var cid = d.contactId || d.contact_id
-      || (d.contact && (d.contact.id || d.contact._id))
-      || '';
-    console.log('[webhook-hp] order lookup contactId:', cid || 'not_found', 'orderId:', orderId);
-    return cid;
-  } catch(e) {
-    console.warn('[webhook-hp] order lookup error:', e.message);
-    return '';
   }
-}
 
-// ── Signature verification (Stripe-style HMAC-SHA256) ──────────────────────────
-function verifySignature(rawBody, sigHeader, secret) {
-  if (!sigHeader || !secret) return true;
-  try {
-    var parts     = sigHeader.split(',');
-    var tPart     = parts.find(function(p){ return p.startsWith('t='); });
-    var v1Part    = parts.find(function(p){ return p.startsWith('v1='); });
-    if (!tPart || !v1Part) return true;
-    var timestamp = tPart.substring(2);
-    var signature = v1Part.substring(3);
-    var payload   = timestamp + '.' + rawBody;
-    var expected  = crypto.createHmac('sha256', secret).update(payload, 'utf8').digest('hex');
-    return crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(signature, 'hex'));
-  } catch(e) {
-    console.warn('[webhook-hp] signature verify error:', e.message);
-    return true;
+  // ── Handle checkout.session.expired ──
+  if (eventType === 'checkout.session.expired') {
+    await pool.query("UPDATE payment_logs SET status='expired', updated_at=NOW() WHERE session_id=$1", [sessionId])
+      .catch(function(e) { console.error('[DB expire]', e.message); });
+    return res.json({ ok: true, action: 'expired' });
   }
-}
 
-// ── Handler ────────────────────────────────────────────────────────────────────────────
-const handler = async function(req, res) {
-  if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
+  // ── Handle checkout.session.completed ──
+  if (eventType !== 'checkout.session.completed') {
+    return res.json({ ok: true, action: 'ignored', type: eventType });
+  }
 
-  var rawBuf;
-  try { rawBuf = await getRawBody(req); }
-  catch(e) { return res.status(400).json({ error: 'Failed to read body' }); }
-  var rawBody = rawBuf.toString('utf8');
+  // ── Idempotency: skip if already processed ──
+  if (sLog.status === 'paid' && sLog.record_payment_done) {
+    console.log('[HP Webhook] already processed, skipping', sessionId);
+    return res.json({ ok: true, action: 'already_processed' });
+  }
 
-  var obj;
-  try { obj = JSON.parse(rawBody); }
-  catch(e) { return res.status(400).json({ ok: false, error: 'invalid JSON' }); }
+  // ── Get token ──
+  let accessToken = '';
+  try { accessToken = await getFreshToken(locationId); }
+  catch(e) { console.error('[token]', e.message); }
 
-  var type       = obj.type || obj.event || '';
-  var dataObj    = obj.data || {};
-  var sessionId  = (dataObj.id || dataObj.sessionId || (dataObj.object && dataObj.object.id)) || obj.sessionId || obj.id || '';
-  var meta       = (dataObj.metadata || (dataObj.object && dataObj.object.metadata)) || obj.metadata || {};
-  var locationId = meta.locationId || '';
+  const amount    = sLog.amount;
+  const contactId = sLog.contact_id;
+  const payType   = sLog.payment_type || 'deposit';
+  const entityId  = sLog.entity_id || sLog.ghl_transaction_id || '';
 
-  console.log('[webhook-hp] type:', type, 'session:', sessionId, 'location:', locationId);
+  // ── Mark paid in DB ──
+  await pool.query(
+    "UPDATE payment_logs SET status='paid', updated_at=NOW() WHERE session_id=$1",
+    [sessionId]
+  ).catch(function(e) { console.error('[DB paid]', e.message); });
 
-  if (locationId) {
+  // ── GHL native: mark invoice paid ──
+  if (payType === 'ghl_native' && entityId && accessToken) {
     try {
-      var cfg = await getMerchantConfig(locationId);
-      var secret = cfg && cfg.handypay_webhook_secret;
-      var sigHeader = req.headers['stripe-signature'] || req.headers['x-handypay-signature'] || '';
-      if (secret && sigHeader && !verifySignature(rawBody, sigHeader, secret)) {
-        console.error('[webhook-hp] signature mismatch for location:', locationId);
-        return res.status(400).json({ ok: false, error: 'invalid signature' });
+      const txRes = await pool.query('SELECT ghl_transaction_id FROM payment_logs WHERE session_id=$1', [sessionId]);
+      const txId  = txRes.rows[0] && txRes.rows[0].ghl_transaction_id;
+      if (txId) {
+        await fireRecordPayment(txId, locationId, amount, 'Paid via HandyPay: ' + sessionId, accessToken);
+        await pool.query("UPDATE payment_logs SET record_payment_done=TRUE WHERE session_id=$1", [sessionId]);
+        console.log('[HP Webhook] invoice marked paid:', txId);
       }
     } catch(e) {
-      console.warn('[webhook-hp] config fetch for sig check failed:', e.message);
+      console.error('[record-payment]', e.message);
     }
   }
 
-  var isPaid = ['payment.succeeded','checkout.session.completed','payment_intent.succeeded'].indexOf(type) !== -1;
-  if (!isPaid) return res.json({ ok: true, skipped: type });
+  // ── Resolve contactId (fallback for native sessions) ──
+  let resolvedContactId = contactId;
+  if (!resolvedContactId && entityId && accessToken) {
+    resolvedContactId = await lookupContactId(accessToken, entityId, locationId);
+    if (resolvedContactId) {
+      await pool.query('UPDATE payment_logs SET contact_id=$1 WHERE session_id=$2', [resolvedContactId, sessionId])
+        .catch(function() {});
+    }
+  }
 
-  // ── IDEMPOTENCY ─────────────────────────────────────────────────────────────
-  if (sessionId) {
+  // ── GHL NATIVE: write to contact fields → triggers GHL Workflow "Deposit Confirmed"
+  // GHL Workflow handles: add tag deposit-paid, add note, send confirmation SMS, start upsell
+  if (resolvedContactId && accessToken) {
     try {
-      var existingLog = await getPaymentLogBySession(sessionId);
-      if (existingLog && existingLog.status === 'paid') {
-        console.log('[webhook-hp] already processed, skipping:', sessionId);
-        return res.json({ ok: true, skipped: 'already_paid' });
-      }
-    } catch(iErr) {
-      console.warn('[webhook-hp] idempotency check error (non-fatal):', iErr.message);
+      await updateContactFields(accessToken, resolvedContactId, {
+        [CF_DEPOSIT_STATUS]: 'paid',
+        [CF_DEPOSIT_AMOUNT]: amount
+      });
+      console.log('[HP Webhook] contact fields updated → GHL workflow triggered for', resolvedContactId);
+    } catch(e) {
+      console.error('[updateContactFields]', e.message);
     }
-  }
-
-  if (sessionId) {
-    try { await updatePaymentLogStatus(sessionId, 'paid'); }
-    catch(e) { console.error('[webhook-hp] status update error:', e.message); }
-  }
-
-  var log        = sessionId ? (await getPaymentLogBySession(sessionId).catch(function(){return null;})) : null;
-  var contactId  = meta.contactId || (log && log.contact_id) || '';
-  if (!locationId) locationId = (log && log.location_id) || '';
-  var amount     = (dataObj.amount_total || (dataObj.object && dataObj.object.amount_total))
-    ? Math.round(((dataObj.amount_total || dataObj.object.amount_total) || 0) / 100)
-    : (log && log.amount) || 0;
-  var currency   = (log && log.currency ? log.currency.toUpperCase() : 'JMD');
-  var payChoice  = meta.paymentChoice || (log && log.payment_type) || 'deposit';
-  var payType    = meta.paymentType   || (log && log.payment_type) || 'deposit';
-
-  if (payType === 'ghl_native') {
-    console.log('[webhook-hp] ghl_native — skipping contact tag/note');
-    return res.json({ ok: true, mode: 'ghl_native' });
-  }
-
-  if (!locationId) return res.json({ ok: true, note: 'no_location' });
-
-  var accessToken = await getFreshToken(locationId).catch(function(){return '';});
-  if (!accessToken) {
-    console.error('[webhook-hp] no CRM token for:', locationId);
-    return res.json({ ok: true, note: 'no_token' });
-  }
-
-  // ── CONTACT LOOKUP ─────────────────────────────────────────────────────────────
-  if (!contactId) {
-    var orderId = meta.entityId || meta.ghlTransactionId || (log && log.ghl_transaction_id) || '';
-    if (orderId) {
-      // lookupContactId now receives locationId to build correct GHL query params
-      contactId = await lookupContactId(accessToken, orderId, locationId);
-    }
-  }
-
-  if (!contactId) {
-    console.log('[webhook-hp] contactId not resolved after order lookup — skipping tag/note');
-    return res.json({ ok: true, note: 'no_contact' });
-  }
-
-  // ── TAGGING ──────────────────────────────────────────────────────────────────────
-  var tag, noteText;
-  if (payChoice === 'full') {
-    tag      = 'full-payment-paid';
-    noteText = 'Full payment received via HandyPay: ' + amount + ' ' + currency;
   } else {
-    tag      = 'deposit-paid';
-    noteText = 'Deposit received via HandyPay: ' + amount + ' ' + currency;
+    console.warn('[HP Webhook] no contactId to update fields for session', sessionId);
   }
 
-  try {
-    await Promise.all([
-      addContactTag(accessToken, contactId, [tag]),
-      addContactNote(accessToken, contactId, noteText)
-    ]);
-    console.log('[webhook-hp] ✅ tagged:', tag, 'contact:', contactId, 'amount:', amount, currency);
-  } catch(e) {
-    console.error('[webhook-hp] tag/note error:', e.message);
-  }
-
-  return res.json({ ok: true, tag, amount, currency, payChoice, contactId });
-};
+  res.json({
+    ok:          true,
+    action:      'processed',
+    sessionId:   sessionId,
+    contactId:   resolvedContactId,
+    amount:      amount,
+    paymentType: payType
+  });
+}
 
 handler.config = { api: { bodyParser: false } };
 module.exports = handler;
