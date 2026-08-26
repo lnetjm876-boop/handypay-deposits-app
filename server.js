@@ -1,4 +1,15 @@
 const express = require('express');
+// server.js — HandyPay Deposits App (GHL-native architecture)
+// Removed in GHL-native refactor (GHL workflows handle all CRM actions):
+//   - getContact() — not needed; app only writes fields, not reads
+//   - refreshCrmToken() — replaced by lib/token.js getFreshToken()
+//   - sendSms() — GHL Workflow 1 sends all deposit SMS
+//   - addContactNote() — GHL Workflow 2 adds all notes
+//   - sendGHLPaymentCapturedWebhook() — no-op, removed
+//   - /api/webhooks/followup — GHL Workflow 3 handles deposit reminders natively
+//
+// App now does ONLY: create HP session + write 2 contact fields + GHL invoice payments
+
 const crypto = require('crypto');
 const { Pool } = require('pg');
 const app = express();
@@ -46,51 +57,9 @@ async function fireRecordPayment(invoiceId, locationId, amount, note, token) {
   return d;
 }
 
-async function getContact(accessToken, contactId) {
-  const r = await fetch(GHL_API + '/contacts/' + contactId, { headers: { 'Authorization': 'Bearer ' + accessToken, 'Version': '2021-07-28' } });
-  if (!r.ok) throw new Error('getContact ' + r.status);
-  const d = await r.json();
-  return d.contact || d;
-}
-
-async function refreshCrmToken(locationId) {
-  const cfg = await getMerchantConfig(locationId);
-  var refreshTok = (cfg && cfg.crm_refresh_token) || '';
-  if (!cfg || !refreshTok) throw new Error('No refresh token');
-  const r = await fetch(GHL_API + '/oauth/token', {
-    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ client_id: GHL_CLIENT_ID, client_secret: GHL_CLIENT_SECRET, grant_type: 'refresh_token', refresh_token: refreshTok })
-  });
-  if (!r.ok) throw new Error('Token refresh ' + r.status);
-  const data = await r.json();
-  await pool.query('UPDATE merchant_configs SET crm_access_token=$1, crm_refresh_token=$2, updated_at=NOW() WHERE location_id=$3', [data.access_token, data.refresh_token, locationId]);
-  return data.access_token;
-}
-
-async function sendSms(accessToken, locationId, contactId, message) {
-  let conversationId;
-  const sr = await fetch(GHL_API + '/conversations/search?contactId=' + contactId + '&locationId=' + locationId, { headers: { 'Authorization': 'Bearer ' + accessToken, 'Version': '2021-04-15' } });
-  if (sr.ok) { const sd = await sr.json(); conversationId = sd.conversations && sd.conversations[0] && sd.conversations[0].id; }
-  if (!conversationId) {
-    const cr = await fetch(GHL_API + '/conversations', { method: 'POST', headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-04-15' }, body: JSON.stringify({ contactId, locationId }) });
-    const cd = await cr.json();
-    conversationId = (cd.conversation && cd.conversation.id) || cd.id;
-  }
-  if (!conversationId) throw new Error('Could not get/create conversation');
-  const mr = await fetch(GHL_API + '/conversations/messages', { method: 'POST', headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-04-15' }, body: JSON.stringify({ type: 'TYPE_WHATSAPP', message, conversationId, contactId }) });
-  if (!mr.ok) { const errText = await mr.text(); throw new Error('SMS send ' + mr.status + ' ' + errText); }
-  return mr.json();
-}
-
 async function addTag(accessToken, contactId, tags) {
   const r = await fetch(GHL_API + '/contacts/' + contactId + '/tags', { method: 'POST', headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ tags }) });
   if (!r.ok) console.error('[tag] failed:', r.status);
-  return r.json().catch(function() {});
-}
-
-async function addContactNote(accessToken, contactId, body) {
-  const r = await fetch(GHL_API + '/contacts/' + contactId + '/notes', { method: 'POST', headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ body }) });
-  if (!r.ok) console.error('[note] failed:', r.status);
   return r.json().catch(function() {});
 }
 
@@ -163,11 +132,6 @@ async function activatePaymentModes(locationId, accessToken, apiKey, mode) {
   } catch(e) { console.error('[activatePaymentModes]', e.message); return { ok: false, error: e.message }; }
 }
 
-async function sendGHLPaymentCapturedWebhook(cfg, sessionId, ghlTransactionId, amount) {
-  if (!cfg || !cfg.crm_access_token) return;
-  console.log('[sendGHLPaymentCapturedWebhook] loc:', cfg.location_id, 'txn:', ghlTransactionId, 'amt:', amount);
-}
-
 app.get('/api/health', (req, res) => { res.json({ status: 'ok', ts: new Date().toISOString() }); });
 
 app.get('/oauth/callback', async (req, res) => {
@@ -196,7 +160,7 @@ app.get('/p/:code', async (req, res) => {
 app.get('/cancel', async (req, res) => {
   var sessionId = req.query.session_id || req.query.sessionId || '';
   if (sessionId) { try { await updatePaymentLogStatus(sessionId, 'cancelled'); } catch(e) {} }
-  res.send('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Payment Cancelled</title><style>body{font-family:-apple-system,sans-serif;background:#fff7f7;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}.card{background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(0,0,0,.08);max-width:420px;width:100%;padding:40px;text-align:center}.icon{font-size:64px;margin-bottom:16px}h1{font-size:22px;font-weight:800;color:#b91c1c;margin-bottom:10px}p{font-size:15px;color:#555;line-height:1.6}</style></head><body><div class="card"><div class="icon">\u274C</div><h1>Payment Cancelled</h1><p>Your payment was not completed.</p><p>Please use the link in your SMS to try again.</p></div><script>try{window.parent.postMessage(JSON.stringify({type:"custom_element_close_response"}),"*");}catch(e){}<\/script></body></html>');
+  res.send('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Payment Cancelled</title><style>body{font-family:-apple-system,sans-serif;background:#fff7f7;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}.card{background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(0,0,0,.08);max-width:420px;width:100%;padding:40px;text-align:center}.icon{font-size:64px;margin-bottom:16px}h1{font-size:22px;font-weight:800;color:#b91c1c;margin-bottom:10px}p{font-size:15px;color:#555;line-height:1.6}</style></head><body><div class="card"><div class="icon">&#10060;</div><h1>Payment Cancelled</h1><p>Your payment was not completed.</p><p>Please use the link in your SMS to try again.</p></div><script>try{window.parent.postMessage(JSON.stringify({type:"custom_element_close_response"}),"*");}catch(e){}<\/script></body></html>');
 });
 
 // CRM WEBHOOK (GHL-native v2): no SMS, writes fields + tag, GHL workflow sends SMS
@@ -245,37 +209,6 @@ app.post('/api/webhooks/crm', async (req, res) => {
     console.log('[CRM Webhook] fields+tag written | contact:', contactId, '| deposit:', depositAmt);
   } catch(err){ console.error('[CRM Webhook] field/tag error:', err.message); }
   res.json({ok:true, depositSessionId:depositSession.id, fullSessionId:fullSession?fullSession.id:null});
-});
-
-app.post('/api/webhooks/followup', async (req, res) => {
-  var b = req.body;
-  var locationId=b.locationId||(b.customData&&b.customData.locationId), contactId=b.contactId||(b.customData&&b.customData.contactId), contactName=b.contactName||(b.customData&&b.customData.contactName)||'there', startTime=b.startTime||(b.customData&&b.customData.startTime), title=b.title||(b.customData&&b.customData.title)||'appointment', followupNum=parseInt(b.followupNum||(b.customData&&b.customData.followupNum)||1);
-  if(!locationId||!contactId) return res.json({ok:false,error:'missing_fields'});
-  var config = await getMerchantConfig(locationId);
-  if(!config||!config.crm_access_token) return res.json({ok:false,error:'no_config'});
-  var token = config.crm_access_token;
-  var links = (await pool.query('SELECT code, payment_type, created_at FROM short_links WHERE contact_id=$1 AND location_id=$2 ORDER BY created_at DESC LIMIT 10', [contactId, locationId])).rows;
-  var depositLink='', fullLink='', fresh=false;
-  var cutoff=new Date(Date.now()-23*60*60*1000);
-  var recentDeposit=links.find(function(l){return l.payment_type==='deposit'&&new Date(l.created_at)>cutoff;});
-  var recentFull=links.find(function(l){return l.payment_type==='full'&&new Date(l.created_at)>cutoff;});
-  if(recentDeposit){depositLink=APP_URL+'/p/'+recentDeposit.code;fresh=true;}
-  if(recentFull){fullLink=APP_URL+'/p/'+recentFull.code;}
-  if(!fresh){
-    var pct2=config.deposit_percentage||30, total=parseFloat(b.appointmentTotal||(b.customData&&b.customData.appointmentTotal)||0), depAmt=total>0?Math.round(total*pct2/100):(config.deposit_amount||0), fullAmt2=total;
-    try {
-      var ds=await createHandyPaySession(config.handypay_api_key,depAmt,'Deposit - '+title,{locationId,contactId,title,startTime,paymentType:'deposit'});
-      var fs=total>0?await createHandyPaySession(config.handypay_api_key,fullAmt2,'Full Payment - '+title,{locationId,contactId,title,startTime,paymentType:'full'}):null;
-      depositLink=await createShortLink(ds.url,ds.id,locationId,contactId,'deposit');
-      fullLink=fs?await createShortLink(fs.url,fs.id,locationId,contactId,'full'):'';
-      await pool.query('INSERT INTO payment_logs (session_id,contact_id,location_id,amount,currency,status,access_token,payment_type,checkout_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (session_id) DO NOTHING',[ds.id,contactId,locationId,depAmt,'jmd','pending',token,'deposit',ds.url||null]);
-      if(fs) await pool.query('INSERT INTO payment_logs (session_id,contact_id,location_id,amount,currency,status,access_token,payment_type,checkout_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (session_id) DO NOTHING',[fs.id,contactId,locationId,fullAmt2,'jmd','pending',token,'full',fs.url||null]);
-    } catch(e){console.error('[followup HP]',e.message);return res.json({ok:false,error:'hp_failed'});}
-  }
-  var pct3=config.deposit_percentage||30,dateStr2=(function(iso){if(!iso)return 'your appointment';try{return new Date(iso).toLocaleString('en-US',{weekday:'long',month:'long',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true});}catch(e){return iso;}})(startTime),firstName2=contactName.split(' ')[0];
-  var msg='Hi '+firstName2+'! Just a reminder — your booking for '+title+' on '+dateStr2+' hasn\'t been confirmed yet.\n\nSecure your spot now:\n\n'+(fullLink?'Deposit ('+pct3+'%):\n'+depositLink+'\n\nFull payment:\n'+fullLink:depositLink)+'\n\nDon\'t lose your spot!';
-  try { await sendSms(token, locationId, contactId, msg); } catch(e){ console.error('[followup SMS]',e.message); }
-  res.json({ok:true,followupNum});
 });
 
 app.get('/api/init-db', async (req, res) => {
