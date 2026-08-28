@@ -172,6 +172,14 @@ const handler = async function(req, res) {
     }).catch(e => console.warn('[webhook-hp] appt confirm:', e.message));
   }
 
+  // Tag full-payment contacts — prevents Balance Collection Reminder from incorrectly firing
+  if (payType === 'full') {
+    try {
+      await addContactTag(token, contactId, ['full-payment-paid']);
+      console.log('[webhook-hp] full-payment-paid tag added | contact:', contactId);
+    } catch (e) { console.warn('[webhook-hp] full-payment-paid tag:', e.message); }
+  }
+
   return res.json({ ok: true, mode: payType, amount, contactId });
 };
 
