@@ -82,7 +82,8 @@ const handler = async function(req, res) {
   }
 
   const isPaid = ['payment.succeeded','checkout.session.completed','payment_intent.succeeded'].includes(type);
-  if (!isPaid) return res.json({ ok: true, skipped: type });
+  const isExpired = type === 'checkout.session.expired';
+  if (!isPaid && !isExpired) return res.json({ ok: true, skipped: type });
 
   // Idempotency
   const existingLog = sessionId ? await getPaymentLog(sessionId).catch(() => null) : null;
@@ -99,6 +100,20 @@ const handler = async function(req, res) {
   const amount    = (dataObj.amount_total || (dataObj.object && dataObj.object.amount_total))
     ? Math.round((dataObj.amount_total || dataObj.object.amount_total) / 100)
     : (log && log.amount) || 0;
+
+  // Expired session → write deposit_status=expired → triggers W4 (Link Expired) workflow
+  if (isExpired) {
+    const expLocId  = locationId || (existingLog && existingLog.location_id) || '';
+    const expContId = meta.contactId || (existingLog && existingLog.contact_id) || '';
+    if (expLocId && expContId) {
+      try {
+        const expTok = await getFreshToken(expLocId);
+        await updateContactFields(expTok, expLocId, expContId, { 'contact.deposit_status': 'expired' });
+        console.log('[webhook-hp] ✅ deposit_status=expired written | contact:', expContId);
+      } catch(e) { console.error('[webhook-hp] expired field write:', e.message); }
+    }
+    return res.json({ ok: true, mode: 'expired' });
+  }
 
   // ghl_native: invoice payment — record it, then done
   if (payType === 'ghl_native') {
