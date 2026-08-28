@@ -10,158 +10,76 @@ const LOGO_URL = 'https://storage.googleapis.com/crm-conversations-ai-production
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
+  max: 2,
+  idleTimeoutMillis: 10000,
+  connectionTimeoutMillis: 5000
 });
+
+const GHL_CUSTOM_FIELDS = [
+  { name: 'Deposit Payment URL',  dataType: 'TEXT',   model: 'contact' },
+  { name: 'Deposit Status',       dataType: 'TEXT',   model: 'contact' },
+  { name: 'Deposit Amount Paid',  dataType: 'NUMERICAL', model: 'contact' }
+];
 
 async function getMerchantConfig(locationId) {
   const { rows } = await pool.query('SELECT * FROM merchant_configs WHERE location_id=$1', [locationId]);
   return rows[0] || null;
 }
 
-// Robust body parser — handles Vercel pre-buffered body (object, string, Buffer) + stream fallback
-async function parseBody(req) {
-  const b = req.body;
-  if (b && typeof b === 'object' && !Buffer.isBuffer(b)) return b;
-  if (typeof b === 'string') { const p = new URLSearchParams(b); const o = {}; for (const [k,v] of p) o[k]=v; return o; }
-  if (Buffer.isBuffer(b)) { const p = new URLSearchParams(b.toString()); const o = {}; for (const [k,v] of p) o[k]=v; return o; }
-  return new Promise((resolve) => {
-    let data = ''; let done = false;
-    const finish = (raw) => { if (done) return; done = true; try { const p = new URLSearchParams(raw); const o = {}; for (const [k,v] of p) o[k]=v; resolve(o); } catch (e) { resolve({}); } };
-    req.on('data', (chunk) => { data += chunk.toString(); });
-    req.on('end', () => finish(data));
-    req.on('error', () => finish(data));
-    setTimeout(() => finish(data), 5000);
-  });
+async function upsertMerchantConfig(locationId, fields) {
+  const keys   = Object.keys(fields);
+  const vals   = Object.values(fields);
+  const setClauses = keys.map((k, i) => `${k}=$${i + 2}`).join(', ');
+  await pool.query(
+    `INSERT INTO merchant_configs (location_id, ${keys.join(', ')}) VALUES ($1, ${vals.map((_, i) => `$${i + 2}`).join(', ')})
+     ON CONFLICT (location_id) DO UPDATE SET ${setClauses}, updated_at = NOW()`,
+    [locationId, ...vals]
+  );
 }
 
-function sendPage(res, locationId, opts) {
-  const { savedMsg, errMsg, cfg } = opts || {};
-  const hasHandypay = cfg && cfg.handypay_api_key;
-  const isPitMode   = cfg && cfg.crm_access_token && !cfg.crm_refresh_token;
-  const isOauthMode = cfg && cfg.crm_access_token && cfg.crm_refresh_token;
-  const maskedPit   = isPitMode ? cfg.crm_access_token.substring(0, 20) + '...' : '';
-
-  let statusBlock = '';
-  if (!hasHandypay) {
-    statusBlock = '<div class="warn">⚠️ Complete HandyPay settings first — enter your HandyPay API key in the sidebar before connecting GHL.</div>';
-  } else if (isPitMode) {
-    statusBlock = '<div class="badge"><span class="dot"></span> GHL Connected (permanent PIT mode) &middot; <code>' + maskedPit + '</code></div>';
-  } else if (isOauthMode) {
-    statusBlock = '<div class="badge oauth"><span class="dot" style="background:#f57c00"></span> GHL Connected (OAuth mode) &middot; Upgrade to permanent PIT below</div>';
-  } else {
-    statusBlock = '<div class="warn">⚠️ GHL not connected — paste your API key below</div>';
-  }
-
-  res.setHeader('Content-Type', 'text/html');
-  res.end(`<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>HandyPay — GHL Connection</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f4f6fb;padding:24px;min-height:100vh}
-.card{background:#fff;border-radius:16px;box-shadow:0 4px 32px rgba(0,0,0,.1);max-width:600px;margin:0 auto;padding:40px}
-.hdr{margin-bottom:24px;padding-bottom:20px;border-bottom:2px solid #f0f0f0}
-.hdr h1{font-size:22px;font-weight:800;color:#005DBD;margin-bottom:4px}
-.hdr p{font-size:13px;color:#888}
-.ok{background:#e8f5e9;border:1px solid #a5d6a7;color:#2e7d32;padding:14px 16px;border-radius:10px;font-size:14px;margin-bottom:18px;line-height:1.5;display:none}
-.err-box{background:#fce4ec;border:1px solid #f48fb1;color:#c62828;padding:14px 16px;border-radius:10px;font-size:14px;margin-bottom:18px;display:none}
-.warn{background:#fff8e1;border:1px solid #ffe082;color:#e65100;padding:14px 16px;border-radius:10px;font-size:13px;margin-bottom:18px;line-height:1.6}
-.badge{background:#e3f2fd;color:#1565c0;padding:10px 16px;border-radius:10px;font-size:13px;margin-bottom:18px;display:flex;align-items:center;gap:8px}
-.badge.oauth{background:#fff3e0;color:#e65100}
-.dot{width:8px;height:8px;border-radius:50%;background:#43a047;flex-shrink:0}
-.steps{background:#f8f9ff;border:1px solid #dde8ff;border-radius:12px;padding:20px;margin:20px 0;line-height:2.2}
-.steps h3{font-size:14px;font-weight:700;color:#005DBD;margin-bottom:8px}
-.step{display:flex;gap:12px;align-items:flex-start;font-size:13px;color:#444;margin-bottom:4px}
-.step-num{background:#005DBD;color:#fff;width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex-shrink:0;margin-top:2px}
-.step-txt code{background:#e8f0fe;padding:2px 6px;border-radius:4px;font-size:11px;font-weight:600}
-label{display:block;font-size:13px;font-weight:700;color:#333;margin-top:20px;margin-bottom:6px}
-input{width:100%;border:2px solid #e0e0e0;border-radius:10px;padding:12px 16px;font-size:14px;font-family:monospace;outline:none;transition:border-color .2s}
-input:focus{border-color:#005DBD;box-shadow:0 0 0 3px rgba(0,93,189,.1)}
-.btn{width:100%;margin-top:24px;background:#005DBD;color:#fff;border:none;border-radius:10px;padding:15px;font-size:16px;font-weight:700;cursor:pointer;transition:background .2s}
-.btn:hover{background:#0047a3}.btn:disabled{background:#aaa;cursor:not-allowed}
-.foot{margin-top:20px;text-align:center;font-size:11px;color:#ccc}
-.pill{display:inline-block;background:#005DBD;color:#fff;font-size:10px;font-weight:700;padding:2px 8px;border-radius:99px;margin-left:6px;vertical-align:middle}
-</style></head>
-<body><div class="card">
-<div class="hdr">
-  <h1>&#128273; GHL Connection <span class="pill">PERMANENT</span></h1>
-  <p>Enter once — never authenticate again</p>
-</div>
-<div class="ok" id="ok-msg"></div>
-<div class="err-box" id="err-msg"></div>
-${statusBlock}
-<div class="steps">
-  <h3>How to find your GHL Private Integration Token</h3>
-  <div class="step"><div class="step-num">1</div><div class="step-txt">In your CRM sub-account, click the <strong>gear icon</strong> (Settings) in the bottom-left sidebar</div></div>
-  <div class="step"><div class="step-num">2</div><div class="step-txt">Go to <strong>Integrations</strong> &rarr; then the <strong>API Key</strong> tab</div></div>
-  <div class="step"><div class="step-num">3</div><div class="step-txt">Copy your API key — it starts with <code>pit-</code></div></div>
-  <div class="step"><div class="step-num">4</div><div class="step-txt">Paste it below and click Save</div></div>
-</div>
-${!isPitMode ? `<div id="form-section">
-  <label for="ghl-key">GHL Private Integration Token *</label>
-  <input type="text" id="ghl-key" placeholder="pit-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autocomplete="off" spellcheck="false">
-  <button class="btn" id="save-btn" onclick="saveKey()">&#128190; Save &amp; Connect Forever</button>
-</div>` : '<p style="text-align:center;color:#2e7d32;font-size:15px;font-weight:700;margin-top:16px">&#9989; Already on permanent PIT mode. Done.</p>'}
-<div class="foot">HandyPay Deposits &middot; Permanent Auth Mode &middot; ${locationId}</div>
-</div>
-<script>
-var LOC="${locationId}";
-async function saveKey(){
-  var key=document.getElementById('ghl-key').value.trim();
-  var btn=document.getElementById('save-btn');
-  var okEl=document.getElementById('ok-msg');
-  var errEl=document.getElementById('err-msg');
-  okEl.style.display='none';errEl.style.display='none';
-  if(!key){errEl.textContent='Please enter your GHL API key.';errEl.style.display='block';return;}
-  btn.disabled=true;btn.textContent='Saving...';
-  try{
-    var r=await fetch('/api/ghl-setup?location_id='+encodeURIComponent(LOC),{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({ghl_api_key:key})
-    });
-    var data=await r.json();
-    if(data.success){
-      okEl.textContent='\u2705 '+data.message;
-      okEl.style.display='block';
-      document.getElementById('form-section').style.display='none';
-    }else{
-      errEl.textContent='\u274C '+(data.error||'Unknown error');
-      errEl.style.display='block';
-    }
-  }catch(e){
-    errEl.textContent='\u274C Network error: '+e.message;
-    errEl.style.display='block';
-  }
-  btn.disabled=false;btn.textContent='\uD83D\uDCBE Save & Connect Forever';
-}
-</script>
-</body></html>`);
+async function fetchWithTimeout(url, opts, ms) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const r = await fetch(url, { ...opts, signal: ctrl.signal });
+    clearTimeout(timer);
+    return r;
+  } catch (e) { clearTimeout(timer); throw e; }
 }
 
-async function createHandyPayCustomFields(locationId, accessToken) {
-  const fields = [
-    { name: 'Deposit Payment URL', dataType: 'TEXT' },
-    { name: 'Deposit Status',      dataType: 'TEXT' },
-    { name: 'Deposit Amount Paid', dataType: 'NUMERICAL' }
-  ];
-  const results = [];
-  for (const f of fields) {
+async function ensureCustomFields(locationId, token) {
+  let existing = [];
+  try {
+    const r = await fetchWithTimeout(
+      `${GHL_API}/locations/${locationId}/customFields?model=contact`,
+      { headers: { Authorization: 'Bearer ' + token, Version: '2021-07-28' } }, 5000
+    );
+    if (r.ok) { const d = await r.json(); existing = d.customFields || []; }
+  } catch (e) { console.warn('[ghl-setup] fetch fields:', e.message); }
+
+  const created = [];
+  for (const cf of GHL_CUSTOM_FIELDS) {
+    const exists = existing.some(f =>
+      f.name.toLowerCase() === cf.name.toLowerCase() ||
+      (f.fieldKey && f.fieldKey.toLowerCase().includes(cf.name.toLowerCase().replace(/ /g, '_')))
+    );
+    if (exists) { console.log('[ghl-setup] field exists:', cf.name); continue; }
     try {
-      const r = await fetch(GHL_API + '/locations/' + locationId + '/customFields', {
-        method: 'POST',
-        headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
-        body: JSON.stringify({ name: f.name, dataType: f.dataType })
-      });
-      const d = await r.json().catch(() => ({}));
-      results.push({ name: f.name, status: r.ok ? 'created' : (r.status === 422 ? 'exists' : 'failed'), id: (d.customField && d.customField.id) || null });
-      console.log('[ghl-setup] field "' + f.name + '":', r.status);
-    } catch(e) {
-      console.error('[ghl-setup] field create err:', e.message);
-      results.push({ name: f.name, status: 'error' });
-    }
+      const cr = await fetchWithTimeout(
+        `${GHL_API}/locations/${locationId}/customFields`,
+        {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json', Version: '2021-07-28' },
+          body: JSON.stringify({ name: cf.name, dataType: cf.dataType, model: cf.model })
+        }, 5000
+      );
+      const cd = await cr.json();
+      console.log('[ghl-setup] created field:', cf.name, cr.status);
+      if (cr.ok && cd.customField) created.push(cd.customField);
+    } catch (e) { console.warn('[ghl-setup] create field:', cf.name, e.message); }
   }
-  return results;
+  return created;
 }
 
 async function registerPaymentProvider(locationId, accessToken) {
@@ -174,6 +92,7 @@ async function registerPaymentProvider(locationId, accessToken) {
         description: 'Collect booking deposits automatically via SMS payment link.',
         paymentsUrl: APP_URL + '/api/pay?locationId=' + locationId,
         queryUrl: APP_URL + '/api/query',
+        refundUrl: APP_URL + '/api/refund',
         imageUrl: LOGO_URL,
         supportsSubscriptionSchedule: false
       })
@@ -182,6 +101,71 @@ async function registerPaymentProvider(locationId, accessToken) {
     console.log('[ghl-setup] register', locationId, r.status);
     return d;
   } catch (e) { console.error('[ghl-setup] register err:', e.message); }
+}
+
+function sendPage(res, locationId, opts) {
+  const cfg     = opts.cfg || null;
+  const isOk    = opts.ok    || false;
+  const errMsg  = opts.error  || '';
+  const pitOk   = cfg && cfg.crm_access_token;
+  const hpOk    = cfg && cfg.handypay_api_key;
+
+  const status = pitOk && hpOk ? 'Connected' : pitOk ? 'PIT saved (HandyPay key pending)' : 'Not configured';
+  const statusColor = (pitOk && hpOk) ? '#1b5e20' : pitOk ? '#e65100' : '#b71c1c';
+
+  res.setHeader('Content-Type', 'text/html');
+  res.end(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>HandyPay — GHL Setup</title>
+  <style>
+    body { font-family: 'Segoe UI', sans-serif; background: #f5f5f5; margin: 0; padding: 40px 20px; }
+    .card { background: #fff; border-radius: 12px; padding: 32px; max-width: 520px; margin: 0 auto; box-shadow: 0 2px 12px rgba(0,0,0,.08); }
+    h2 { margin-top:0; color:#1a1a2e; }
+    label { display:block; font-size:13px; font-weight:600; color:#555; margin-bottom:4px; margin-top:16px; }
+    input { width:100%; box-sizing:border-box; padding:10px 12px; border:1px solid #ddd; border-radius:6px; font-size:14px; }
+    input:focus { outline:none; border-color:#4f46e5; }
+    .btn { display:block; width:100%; padding:12px; background:#4f46e5; color:#fff; border:none; border-radius:8px; font-size:15px; font-weight:600; cursor:pointer; margin-top:20px; }
+    .btn:hover { background:#4338ca; }
+    .status-box { border-radius:8px; padding:12px 16px; margin-bottom:20px; font-size:13px; }
+    .ok  { background:#e8f5e9; color:#1b5e20; border:1px solid #a5d6a7; }
+    .err { background:#ffebee; color:#b71c1c; border:1px solid #ef9a9a; }
+  </style>
+</head>
+<body>
+<div class="card">
+  <h2>HandyPay — GHL Setup</h2>
+  ${isOk  ? `<div class="status-box ok">✅ Configuration saved. HandyPay is connected and ready.</div>` : ''}
+  ${errMsg ? `<div class="status-box err">❌ ${errMsg}</div>` : ''}
+  <p style="font-size:13px;color:#666;">Status: <strong style="color:${statusColor}">${status}</strong></p>
+
+  <form method="POST" action="/api/ghl-setup?location_id=${locationId}">
+    <label>GHL Private Integration Token (PIT)</label>
+    <input type="password" name="pit" placeholder="eyJhbG..." required value="" autocomplete="off"/>
+
+    <label>HandyPay API Key</label>
+    <input type="password" name="hp_key" placeholder="hp_live_..." required value="" autocomplete="off"/>
+
+    <label>Deposit % (e.g. 30 for 30%)</label>
+    <input type="number" name="deposit_pct" min="1" max="100" step="0.1" value="${cfg ? cfg.deposit_percentage || 30 : 30}"/>
+
+    <button class="btn" type="submit">💾 Save & Connect Forever</button>
+  </form>
+
+  <p style="font-size:11px;color:#aaa;margin-top:24px;">
+    Tokens are encrypted and stored securely. Location ID: <code>${locationId}</code>
+  </p>
+</div>
+<script>
+var btn = document.querySelector('.btn');
+if(btn) btn.addEventListener('click', function() {
+  btn.disabled = true;
+  btn.textContent = 'Saving...';
+});
+</script>
+</body></html>`);
 }
 
 module.exports = async function handler(req, res) {
@@ -199,52 +183,69 @@ module.exports = async function handler(req, res) {
     return;
   }
 
-  if (req.method === 'POST') {
-    let body = {};
-    try { body = await parseBody(req); } catch (e) { console.error('[ghl-setup] parseBody err:', e.message); }
+  if (req.method !== 'POST') return res.status(405).end();
 
-    const ghlApiKey = (body.ghl_api_key || '').trim();
-    console.log('[ghl-setup] POST loc=' + locationId + ' keyLen=' + ghlApiKey.length + ' prefix=' + ghlApiKey.substring(0, 8));
-
-    if (!ghlApiKey) {
-      const cfg = await getMerchantConfig(locationId).catch(() => null);
-      sendPage(res, locationId, { cfg, errMsg: 'GHL API Key is required — paste your pit- key above.' });
-      return;
-    }
-    if (!ghlApiKey.startsWith('pit-') && !ghlApiKey.startsWith('eyJ')) {
-      const cfg = await getMerchantConfig(locationId).catch(() => null);
-      sendPage(res, locationId, { cfg, errMsg: 'Invalid key — should start with pit- (got: ' + ghlApiKey.substring(0, 8) + '...)' });
-      return;
-    }
-
-    try {
-      const cfg = await getMerchantConfig(locationId);
-      if (!cfg) {
-        sendPage(res, locationId, { errMsg: 'Location not found — complete HandyPay Settings first.' });
-        return;
-      }
-
-      // Store PIT, NULL out refresh_token → permanent mode (only crm_ columns exist)
-      await pool.query(
-        'UPDATE merchant_configs SET crm_access_token=$1, crm_refresh_token=NULL, updated_at=NOW() WHERE location_id=$2',
-        [ghlApiKey, locationId]
-      );
-      console.log('[ghl-setup] PIT stored for', locationId);
-
-      await registerPaymentProvider(locationId, ghlApiKey);
-      // Auto-create the 3 HandyPay contact custom fields (idempotent — safe to repeat)
-      createHandyPayCustomFields(locationId, ghlApiKey).catch(e => console.error('[ghl-setup] fields (non-fatal):', e.message));
-
-      const updatedCfg = await getMerchantConfig(locationId).catch(() => null);
-      return res.json ? res.json({ success: true, message: 'GHL API Key saved. Permanent PIT mode active — no OAuth or re-auth ever needed.' })
-                      : (res.setHeader('Content-Type','application/json'), res.end(JSON.stringify({ success: true, message: 'GHL API Key saved. Permanent PIT mode active — no OAuth or re-auth ever needed.' })));
-    } catch (e) {
-      console.error('[ghl-setup] POST error:', e.message);
-      return res.json ? res.json({ success: false, error: e.message })
-                      : (res.setHeader('Content-Type','application/json'), res.end(JSON.stringify({ success: false, error: e.message })));
-    }
+  // Parse body — Vercel serverless with express middleware
+  let body = req.body || {};
+  if (typeof body === 'string') {
+    try { body = Object.fromEntries(new URLSearchParams(body)); } catch (e) {}
   }
 
-  res.statusCode = 405;
-  res.end('Method Not Allowed');
+  const pit    = (body.pit    || '').trim();
+  const hp_key = (body.hp_key || '').trim();
+  const depositPct = parseFloat(body.deposit_pct || '30') || 30;
+
+  if (!pit || !hp_key) {
+    const cfg = await getMerchantConfig(locationId).catch(() => null);
+    sendPage(res, locationId, { cfg, error: 'Both PIT token and HandyPay API key are required.' });
+    return;
+  }
+
+  // Validate PIT against GHL API
+  let ghlUserId = '', tokenWorks = false;
+  try {
+    const vr = await fetchWithTimeout(
+      GHL_API + '/users/me',
+      { headers: { Authorization: 'Bearer ' + pit, Version: '2021-07-28' } }, 5000
+    );
+    if (vr.ok) {
+      const vd = await vr.json();
+      ghlUserId = vd.id || '';
+      tokenWorks = true;
+    }
+  } catch (e) { console.warn('[ghl-setup] validate PIT:', e.message); }
+
+  if (!tokenWorks) {
+    const cfg = await getMerchantConfig(locationId).catch(() => null);
+    sendPage(res, locationId, { cfg, error: 'GHL token validation failed. Check your PIT and try again.' });
+    return;
+  }
+
+  // Save config
+  try {
+    await upsertMerchantConfig(locationId, {
+      crm_access_token: pit,
+      handypay_api_key: hp_key,
+      deposit_percentage: depositPct,
+      deposit_amount: 5000
+    });
+  } catch (e) {
+    sendPage(res, locationId, { error: 'Database save failed: ' + e.message });
+    return;
+  }
+
+  // Auto-create HandyPay custom fields
+  const created = await ensureCustomFields(locationId, pit).catch(e => {
+    console.warn('[ghl-setup] ensureCustomFields error:', e.message);
+    return [];
+  });
+  console.log('[ghl-setup] ensureCustomFields created:', created.length);
+
+  // Register as GHL custom payment provider
+  await registerPaymentProvider(locationId, pit).catch(e =>
+    console.warn('[ghl-setup] registerPaymentProvider:', e.message)
+  );
+
+  const cfg = await getMerchantConfig(locationId).catch(() => null);
+  sendPage(res, locationId, { cfg, ok: true });
 };
