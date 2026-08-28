@@ -139,6 +139,31 @@ async function saveKey(){
 </body></html>`);
 }
 
+async function createHandyPayCustomFields(locationId, accessToken) {
+  const fields = [
+    { name: 'Deposit Payment URL', dataType: 'TEXT' },
+    { name: 'Deposit Status',      dataType: 'TEXT' },
+    { name: 'Deposit Amount Paid', dataType: 'NUMERICAL' }
+  ];
+  const results = [];
+  for (const f of fields) {
+    try {
+      const r = await fetch(GHL_API + '/locations/' + locationId + '/customFields', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
+        body: JSON.stringify({ name: f.name, dataType: f.dataType })
+      });
+      const d = await r.json().catch(() => ({}));
+      results.push({ name: f.name, status: r.ok ? 'created' : (r.status === 422 ? 'exists' : 'failed'), id: (d.customField && d.customField.id) || null });
+      console.log('[ghl-setup] field "' + f.name + '":', r.status);
+    } catch(e) {
+      console.error('[ghl-setup] field create err:', e.message);
+      results.push({ name: f.name, status: 'error' });
+    }
+  }
+  return results;
+}
+
 async function registerPaymentProvider(locationId, accessToken) {
   try {
     const r = await fetch(GHL_API + '/payments/custom-provider/provider?locationId=' + locationId, {
@@ -207,6 +232,8 @@ module.exports = async function handler(req, res) {
       console.log('[ghl-setup] PIT stored for', locationId);
 
       await registerPaymentProvider(locationId, ghlApiKey);
+      // Auto-create the 3 HandyPay contact custom fields (idempotent — safe to repeat)
+      createHandyPayCustomFields(locationId, ghlApiKey).catch(e => console.error('[ghl-setup] fields (non-fatal):', e.message));
 
       const updatedCfg = await getMerchantConfig(locationId).catch(() => null);
       return res.json ? res.json({ success: true, message: 'GHL API Key saved. Permanent PIT mode active — no OAuth or re-auth ever needed.' })
