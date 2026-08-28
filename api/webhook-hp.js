@@ -104,11 +104,14 @@ const handler = async function(req, res) {
     ).catch(e => console.warn('[webhook-hp] pi_id store:', e.message));
   }
 
-  const log       = existingLog || (sessionId ? await getPaymentLog(sessionId).catch(() => null) : null);
-  const locId     = locationId || (log && log.location_id) || '';
-  const contactId = meta.contactId || (log && log.contact_id) || '';
-  const payType   = meta.paymentType || (log && log.payment_type) || 'deposit';
-  const amount    = (dataObj.amount_total || (dataObj.object && dataObj.object.amount_total))
+  const log           = existingLog || (sessionId ? await getPaymentLog(sessionId).catch(() => null) : null);
+  const locId         = locationId || (log && log.location_id) || '';
+  const contactId     = meta.contactId || (log && log.contact_id) || '';
+  const payType       = meta.paymentType || (log && log.payment_type) || 'deposit';
+  // paymentChoice covers the /api/pay path where paymentType is hardcoded 'calendar'
+  // but paymentChoice carries 'deposit'|'full' from the client UI selection
+  const paymentChoice = meta.paymentChoice || (log && log.payment_type) || '';
+  const amount        = (dataObj.amount_total || (dataObj.object && dataObj.object.amount_total))
     ? Math.round((dataObj.amount_total || dataObj.object.amount_total) / 100)
     : (log && log.amount) || 0;
 
@@ -172,15 +175,19 @@ const handler = async function(req, res) {
     }).catch(e => console.warn('[webhook-hp] appt confirm:', e.message));
   }
 
-  // Tag full-payment contacts — prevents Balance Collection Reminder from incorrectly firing
-  if (payType === 'full') {
+  // Tag full-payment contacts — prevents Balance Collection Reminder from incorrectly firing.
+  // isFullPayment covers two paths:
+  //   1. CRM webhook path: payType='full' (metadata.paymentType set by server.js)
+  //   2. /api/pay chooser path: paymentChoice='full' (metadata.paymentChoice set by create-session.js)
+  const isFullPayment = payType === 'full' || paymentChoice === 'full';
+  if (isFullPayment) {
     try {
       await addContactTag(token, contactId, ['full-payment-paid']);
       console.log('[webhook-hp] full-payment-paid tag added | contact:', contactId);
     } catch (e) { console.warn('[webhook-hp] full-payment-paid tag:', e.message); }
   }
 
-  return res.json({ ok: true, mode: payType, amount, contactId });
+  return res.json({ ok: true, mode: payType, paymentChoice, isFullPayment, amount, contactId });
 };
 
 handler.config = { api: { bodyParser: false } };
