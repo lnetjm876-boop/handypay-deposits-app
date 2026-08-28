@@ -58,7 +58,7 @@ async function refreshToken(locationId, refreshTok) {
         'UPDATE merchant_configs SET crm_access_token=$1, crm_refresh_token=$2, updated_at=NOW() WHERE location_id=$3',
         [d.access_token, d.refresh_token || refreshTok, locationId]
       );
-      console.log('[pay] token refreshed ✅');
+      console.log('[pay] token refreshed');
       return d.access_token;
     }
   } catch (e) { console.error('[pay] refresh error:', e.message); }
@@ -93,6 +93,13 @@ function parseOrderAmounts(pd) {
   };
 }
 
+// Extracts the creation timestamp (ms) encoded in a MongoDB ObjectID's first 4 bytes.
+// Used to prioritise very recent orders (invoice just triggered) over older calendar ones.
+function objectIdTimestampMs(id) {
+  if (!id || typeof id !== 'string' || id.length < 8) return 0;
+  try { return parseInt(id.substring(0, 8), 16) * 1000; } catch (e) { return 0; }
+}
+
 module.exports = async function handler(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'GET only' });
 
@@ -109,12 +116,7 @@ module.exports = async function handler(req, res) {
   let srvOrderId = '', srvDepAmt = 0, srvFullAmt = 0, srvOrderCur = 'JMD', srvOrderDesc = '';
   let tokenStatus = 'no_location';
 
-  // ── FAST PATH: direct order fetch by URL-supplied order ID ────────────────
-  // GHL sometimes passes the order/payment-intent ID in the URL when loading
-  // the payment iframe. When present, fetch that specific order directly via
-  // the unauthenticated public endpoint — no CRM token needed.
-  // This short-circuits the "fetch latest order" approach and isolates each
-  // customer's session correctly even under concurrent load.
+  // ── FAST PATH: direct order fetch by URL-supplied order ID ────────────────────────────
   if (urlTxId) {
     try {
       const pr = await fetchWithTimeout(
@@ -129,18 +131,18 @@ module.exports = async function handler(req, res) {
         srvOrderDesc = desc;
         srvOrderId   = urlTxId;
         tokenStatus  = 'url_direct';
-        console.log('[pay] ✅ url-direct dep:', srvDepAmt, 'full:', srvFullAmt, cur, 'id:', urlTxId);
+        console.log('[pay] url-direct dep:', srvDepAmt, 'full:', srvFullAmt, cur, 'id:', urlTxId);
       }
     } catch(e) {
       console.warn('[pay] url-direct failed, falling back to order list:', e.message);
     }
   }
 
-  // ── FALLBACK: fetch latest order via CRM token ───────────────────────────
+  // ── FALLBACK: fetch latest order via CRM token ────────────────────────────────────────
   // Used when GHL does not include the order ID in the URL (calendar flow).
   // Fetches the 5 most recent unpaid orders for this location and picks the
-  // newest calendar order. Race-prone when multiple customers book simultaneously
-  // but there is no alternative when the order ID is not in the URL.
+  // newest one (using MongoDB ObjectID timestamp for recency — prefers orders
+  // created in the last 5 min, covering invoice payment context).
   if (locationId && !srvOrderId) {
     try {
       const { rows } = await pool.query(
@@ -166,7 +168,12 @@ module.exports = async function handler(req, res) {
         const sorted = Array.isArray(orders)
           ? [...orders].sort((a, b) => ((b._id || '') > (a._id || '') ? 1 : -1))
           : [];
-        const calOrder = sorted.find(o => o.sourceType === 'calendar' || (o.source && o.source.type === 'calendar'))
+        // Prefer the most-recent order created in the last 5 min (covers invoice context);
+        // fall back to the most-recent calendar order, then any order.
+        const _now1 = Date.now(), _5m = 5 * 60 * 1000;
+        const recentAny1 = sorted.find(o => (_now1 - objectIdTimestampMs(o._id)) < _5m);
+        const calOrder = recentAny1
+          || sorted.find(o => o.sourceType === 'calendar' || (o.source && o.source.type === 'calendar'))
           || sorted[0] || null;
         const orderId  = calOrder ? (calOrder._id || '') : '';
 
@@ -181,7 +188,7 @@ module.exports = async function handler(req, res) {
               srvOrderCur  = cur;
               srvOrderDesc = desc;
               srvOrderId   = orderId;
-              console.log('[pay] ✅ dep:', srvDepAmt, 'full:', srvFullAmt, srvOrderCur, 'orderId:', orderId);
+              console.log('[pay] dep:', srvDepAmt, 'full:', srvFullAmt, srvOrderCur, 'orderId:', orderId);
             }
           } catch (pe) { console.error('[pay] public order:', pe.message); }
         }
@@ -192,7 +199,11 @@ module.exports = async function handler(req, res) {
           tokenStatus = 'refreshed_cold';
           const orders = await fetchOrders(locationId, newTok) || [];
           const sorted = [...orders].sort((a, b) => ((b._id || '') > (a._id || '') ? 1 : -1));
-          const calOrder = sorted.find(o => o.sourceType === 'calendar' || (o.source && o.source.type === 'calendar')) || sorted[0];
+          const _now2 = Date.now();
+          const recentAny2 = sorted.find(o => (Date.now() - objectIdTimestampMs(o._id)) < 5 * 60 * 1000);
+          const calOrder = recentAny2
+            || sorted.find(o => o.sourceType === 'calendar' || (o.source && o.source.type === 'calendar'))
+            || sorted[0];
           const orderId  = calOrder ? (calOrder._id || '') : '';
           if (orderId) {
             try {
@@ -205,7 +216,7 @@ module.exports = async function handler(req, res) {
                 srvOrderCur  = cur;
                 srvOrderDesc = desc;
                 srvOrderId   = orderId;
-                console.log('[pay] ✅ dep (cold):', srvDepAmt, 'full:', srvFullAmt);
+                console.log('[pay] dep (cold):', srvDepAmt, 'full:', srvFullAmt);
               }
             } catch (pe) {}
           }
@@ -349,76 +360,65 @@ function openHP(choice){
   });
 }
 
-(function init(){
-  window.parent.postMessage(JSON.stringify({type:'custom_element_loaded'}),'*');
-  window.parent.postMessage({type:'custom_element_loaded'},'*');
-  if(SRV_DEP>0){
-    setTimeout(function(){if(!done&&DEP_AMT===0)applyAmts(SRV_DEP,SRV_FULL,SRV_CUR,SRV_DESC,SRV_ORD);},800);
-  }
-  if(URL_AMT>0)applyAmts(URL_AMT,0,URL_CUR,'',URL_TXN);
-})();
+// Initialise with server-rendered amounts
+applyAmts(SRV_DEP,SRV_FULL,SRV_CUR,SRV_DESC,SRV_ORD);
 
-window.addEventListener('message',function(e){
-  var data;try{data=typeof e.data==='object'?e.data:JSON.parse(e.data);}catch(x){return;}
-  if(!data)return;
-  var t=data.type||'';
-  if(t==='PAYMENT_SUCCESS'){confirmPayment();return;}
-  if(t==='payment_initiate_props'){
-    var pAmt=parseFloat(data.amount||data.amountJMD||0);
-    if(pAmt>0)applyAmts(
-      pAmt>=100000?Math.round(pAmt/100):pAmt,
-      0,
-      data.currency||'JMD',
-      data.description||data.name||'',
-      data.entityId||data.orderId||''
-    );
+// Listen for GHL postMessage (payment_initiate_props) as a secondary source
+window.addEventListener('message',function(ev){
+  var d=ev.data;
+  if(typeof d==='string'){try{d=JSON.parse(d);}catch(e){return;}}
+  if(!d||typeof d!=='object')return;
+  var t=d.type||d.event||'';
+  if(t==='payment_initiate_props'||t==='paymentInitiateProps'){
+    var o=d.data||d.payload||d||{};
+    var amt=parseFloat(o.amount||o.amountJMD||o.totalAmount||'0')||0;
+    var cur=(o.currency||'JMD').toUpperCase();
+    var txId=o.orderId||o.paymentIntentId||o.transactionId||o.entityId||'';
+    if(amt>0)applyAmts(amt,0,cur,o.description||DESC,txId||INV);
   }
 });
 `;
 
-  const css = `
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f8faff;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:16px}
-.card{background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(0,0,0,.08);max-width:440px;width:100%;padding:28px;text-align:center}
-.logo{font-size:36px;margin-bottom:6px}
-.brand{font-size:17px;font-weight:800;color:#1a1a1a;margin-bottom:4px}
-.svc{font-size:13px;color:#666;margin-bottom:20px;min-height:16px;line-height:1.4}
-.opts{display:none;gap:10px;margin-bottom:16px}
-.opt-btn{flex:1;background:#fff;border:2px solid #e2e8f0;border-radius:12px;padding:14px 8px;cursor:pointer;transition:border-color .15s,background .15s;text-align:center;font-family:inherit}
-.opt-btn:hover:not(:disabled){border-color:#15803d;background:#f0fdf4}
-.opt-btn:disabled{opacity:.5;cursor:not-allowed}
-.opt-label{font-size:11px;font-weight:700;color:#666;text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px}
-.opt-amt{font-size:20px;font-weight:800;color:#15803d;margin-bottom:3px}
-.opt-sub{font-size:11px;color:#888}
-.single{display:none;margin-bottom:16px}
-.single-amt{font-size:28px;font-weight:800;color:#15803d;margin-bottom:14px}
-.btn{background:#15803d;color:#fff;border:none;border-radius:10px;padding:13px 24px;font-size:15px;font-weight:700;cursor:pointer;width:100%;font-family:inherit}
-.btn:disabled{opacity:.6;cursor:not-allowed}
-.st{font-size:13px;color:#555;margin-top:10px;min-height:18px;line-height:1.5}
-`;
-
-  const html = `<!DOCTYPE html><html><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HandyPay</title>
-<style>${css}</style>
-</head><body><div class="card">
-<div class="logo">&#x1F4B3;</div>
+  const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>HandyPay</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f2f5;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px;}
+.card{background:#fff;border-radius:16px;padding:32px 28px;width:100%;max-width:420px;box-shadow:0 4px 24px rgba(0,0,0,.08);text-align:center;}
+.logo{width:48px;height:32px;margin-bottom:12px;}
+.brand{font-size:20px;font-weight:700;color:#1a1a2e;margin-bottom:6px;}
+.svc{font-size:14px;color:#666;margin-bottom:24px;}
+.opts{display:none;gap:12px;margin-bottom:16px;}
+.opt{flex:1;border:2px solid #e5e7eb;border-radius:12px;padding:16px 12px;cursor:pointer;transition:.15s;background:#fff;}
+.opt:hover{border-color:#4f46e5;background:#f5f3ff;}
+.opt-label{font-size:11px;font-weight:600;color:#888;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;}
+.opt-amt{font-size:22px;font-weight:800;color:#4f46e5;}
+.opt-sub{font-size:11px;color:#aaa;margin-top:4px;}
+.single{display:none;margin-bottom:16px;}
+.btn-single{width:100%;padding:16px;background:#4f46e5;color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;}
+.btn-single:hover{background:#4338ca;}
+.st{font-size:13px;color:#888;min-height:20px;}
+</style>
+</head><body>
+<div class="card">
+<img class="logo" src="https://storage.googleapis.com/crm-conversations-ai-production/ask-ai-images/1785549533996/aaf88bbe-7f89-44b6-ba1b-12a6417755f6.png" alt="HandyPay"/>
 <div class="brand">HandyPay</div>
-<div class="svc" id="svc">Loading payment details...</div>
-<div class="opts" id="opts">
-  <button class="opt-btn" id="btn-dep" onclick="openHP('deposit')">
-    <div class="opt-label">Pay Deposit</div>
-    <div class="opt-amt" id="dep-amt"></div>
-    <div class="opt-sub">Secures your spot</div>
-  </button>
-  <button class="opt-btn" id="btn-full" onclick="openHP('full')">
-    <div class="opt-label">Pay in Full</div>
-    <div class="opt-amt" id="full-amt"></div>
-    <div class="opt-sub">Nothing owed later</div>
-  </button>
+<div class="svc" id="svc">Loading...</div>
+<div class="opts" id="opts" style="display:flex">
+<div class="opt" id="btn-dep" onclick="openHP('deposit')">
+  <div class="opt-label">PAY DEPOSIT</div>
+  <div class="opt-amt" id="dep-amt">...</div>
+  <div class="opt-sub">Secures your spot</div>
+</div>
+<div class="opt" id="btn-full" onclick="openHP('full')">
+  <div class="opt-label">PAY IN FULL</div>
+  <div class="opt-amt" id="full-amt">...</div>
+  <div class="opt-sub">Nothing owed later</div>
+</div>
 </div>
 <div class="single" id="single">
-  <div class="single-amt" id="single-amt"></div>
-  <button class="btn" id="btn-single" onclick="openHP('deposit')">Open HandyPay Checkout</button>
+  <button class="btn-single" id="btn-single" onclick="openHP('deposit')">Open HandyPay Checkout</button>
 </div>
 <div class="st" id="st"></div>
 </div>
