@@ -93,6 +93,17 @@ const handler = async function(req, res) {
   }
   if (sessionId) await markLogPaid(sessionId).catch(e => console.error('[webhook-hp] mark paid:', e.message));
 
+  // Store payment_intent_id if present (needed for refunds)
+  const paymentIntentId = dataObj.payment_intent
+    || (dataObj.object && dataObj.object.payment_intent)
+    || obj.payment_intent || '';
+  if (sessionId && paymentIntentId) {
+    pool.query(
+      'UPDATE payment_logs SET payment_intent_id=$1 WHERE session_id=$2',
+      [paymentIntentId, sessionId]
+    ).catch(e => console.warn('[webhook-hp] pi_id store:', e.message));
+  }
+
   const log       = existingLog || (sessionId ? await getPaymentLog(sessionId).catch(() => null) : null);
   const locId     = locationId || (log && log.location_id) || '';
   const contactId = meta.contactId || (log && log.contact_id) || '';
@@ -101,7 +112,7 @@ const handler = async function(req, res) {
     ? Math.round((dataObj.amount_total || dataObj.object.amount_total) / 100)
     : (log && log.amount) || 0;
 
-  // Expired session → write deposit_status=expired → triggers W4 (Link Expired) workflow
+  // Expired session — write deposit_status=expired — triggers W4 (Link Expired) workflow
   if (isExpired) {
     const expLocId  = locationId || (existingLog && existingLog.location_id) || '';
     const expContId = meta.contactId || (existingLog && existingLog.contact_id) || '';
@@ -109,7 +120,7 @@ const handler = async function(req, res) {
       try {
         const expTok = await getFreshToken(expLocId);
         await updateContactFields(expTok, expLocId, expContId, { 'contact.deposit_status': 'expired' });
-        console.log('[webhook-hp] ✅ deposit_status=expired written | contact:', expContId);
+        console.log('[webhook-hp] deposit_status=expired written | contact:', expContId);
       } catch(e) { console.error('[webhook-hp] expired field write:', e.message); }
     }
     return res.json({ ok: true, mode: 'expired' });
@@ -127,7 +138,7 @@ const handler = async function(req, res) {
     return res.json({ ok: true, mode: 'ghl_native' });
   }
 
-  // Deposit / full payment — update contact fields → GHL workflow takes over
+  // Deposit / full payment — update contact fields — GHL workflow takes over
   if (!locId) return res.json({ ok: true, note: 'no_location' });
 
   let token;
@@ -142,13 +153,13 @@ const handler = async function(req, res) {
     return res.json({ ok: true, note: 'no_contact' });
   }
 
-  // Write deposit_status + deposit_amount_paid → GHL Workflow fires from here
+  // Write deposit_status + deposit_amount_paid — GHL Workflow fires from here
   try {
     await updateContactFields(token, locId, contactId, {
       'contact.deposit_status':      'paid',
       'contact.deposit_amount_paid': String(amount)
     });
-    console.log('[webhook-hp] ✅ fields updated | contact:', contactId, '| JMD', amount);
+    console.log('[webhook-hp] fields updated | contact:', contactId, '| JMD', amount);
   } catch (e) { console.error('[webhook-hp] updateContactFields:', e.message); }
 
   // Confirm appointment in calendar (non-blocking)
