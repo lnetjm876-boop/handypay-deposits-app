@@ -64,12 +64,12 @@ async function addTag(accessToken, contactId, tags) {
 }
 
 // updateContactField: writes custom fields to contact
-// GHL workflows read these fields and send SMS, add tags, notes, upsells
+// FIX: removed locationId from body (causes 422) + strip model prefix from key
 async function updateContactField(accessToken, locationId, contactId, fieldMap) {
   if (!accessToken || !contactId) return false;
-  const customFields = Object.entries(fieldMap).map(([key, field_value]) => ({ key, field_value: String(field_value == null ? '' : field_value) }));
+  const customFields = Object.entries(fieldMap).map(([key, field_value]) => ({ key: key.replace(/^[a-z]+\./, ''), field_value: String(field_value == null ? '' : field_value) }));
   try {
-    const r = await fetch(GHL_API + '/contacts/' + contactId, { method: 'PUT', headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ locationId, customFields }) });
+    const r = await fetch(GHL_API + '/contacts/' + contactId, { method: 'PUT', headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Version': '2021-07-28' }, body: JSON.stringify({ customFields }) });
     if (!r.ok) { const t = await r.text().catch(() => ''); console.error('[updateContactField]', r.status, t.slice(0,100)); return false; }
     return true;
   } catch(e) { console.error('[updateContactField] error:', e.message); return false; }
