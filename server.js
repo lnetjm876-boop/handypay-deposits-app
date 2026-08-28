@@ -87,13 +87,26 @@ async function createShortLink(fullUrl, sessionId, locationId, contactId, paymen
 
 async function createHandyPaySession(apiKey, amountJMD, label, meta, passFeesToCustomer) {
   if(passFeesToCustomer===undefined) passFeesToCustomer=true;
-  var r = await fetch(HP_BASE + '/payment-sessions', { method: 'POST', headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' }, body: JSON.stringify({ amount: amountJMD, currency: 'jmd', label, pass_fees_to_customer: passFeesToCustomer, success_url: APP_URL + '/success', cancel_url: APP_URL + '/cancel', metadata: meta || {} }) });
-  var d = await r.json();
-  if(!r.ok) throw new Error('HP session ' + r.status + ': ' + JSON.stringify(d).slice(0,80));
+  var payload = {
+    line_items: [{ amount: Math.round(amountJMD) * 100, currency: 'jmd', name: label, quantity: 1 }],
+    mode: 'payment',
+    pass_fees_to_customer: passFeesToCustomer !== false,
+    success_url: APP_URL + '/success?session_id={CHECKOUT_SESSION_ID}',
+    cancel_url: APP_URL + '/cancel',
+    metadata: meta || {}
+  };
+  var r = await fetch(HP_BASE + '/payment-sessions', { method: 'POST', headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+  var d = await r.json().catch(() => ({}));
+  if(!r.ok) {
+    var em = JSON.stringify(d).toLowerCase();
+    if (r.status === 429 || em.includes('too many') || em.includes('session limit'))
+      throw new Error('too_many_sessions: open session exists, wait a moment.');
+    throw new Error('HP session ' + r.status + ': ' + JSON.stringify(d).slice(0,120));
+  }
   var data = d.data || d;
   var id = data.id || data.session_id || data.sessionId || '';
   var url = data.url || data.checkout_url || data.checkoutUrl || '';
-  if(!id) throw new Error('HP session: no id: ' + JSON.stringify(data).slice(0,80));
+  if(!id || !url) throw new Error('HP session: no id/url: ' + JSON.stringify(data).slice(0,120));
   return { id, url };
 }
 
@@ -215,68 +228,30 @@ app.get('/api/init-db', async (req, res) => {
   const secret = req.query.secret || '';
   if(secret !== INIT_SECRET && secret !== 'handypay-init-2026-lnet') return res.status(401).json({error:'unauthorized'});
   try {
-    await pool.query(`CREATE TABLE IF NOT EXISTS merchant_configs (id SERIAL PRIMARY KEY, location_id TEXT UNIQUE NOT NULL, handypay_api_key TEXT, crm_access_token TEXT, crm_refresh_token TEXT, ghl_access_token TEXT, ghl_refresh_token TEXT, deposit_amount INTEGER DEFAULT 5000, deposit_type TEXT DEFAULT 'percentage', deposit_percentage FLOAT DEFAULT 30, success_url TEXT, cancel_url TEXT, mode TEXT DEFAULT 'test', sms_template TEXT, handypay_webhook_id TEXT, handypay_webhook_secret TEXT, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS payment_logs (id SERIAL PRIMARY KEY, session_id TEXT UNIQUE, location_id TEXT, contact_id TEXT, amount INTEGER, currency TEXT DEFAULT 'jmd', status TEXT DEFAULT 'pending', payment_type TEXT DEFAULT 'deposit', checkout_url TEXT, ghl_transaction_id TEXT, entity_id TEXT, appointment_id TEXT, appointment_id_v2 TEXT, access_token TEXT, record_payment_done BOOLEAN DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS short_links (id SERIAL PRIMARY KEY, code TEXT UNIQUE NOT NULL, full_url TEXT NOT NULL, session_id TEXT, location_id TEXT, contact_id TEXT, payment_type TEXT, created_at TIMESTAMPTZ DEFAULT NOW())`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS debug_messages (id SERIAL PRIMARY KEY, location_id TEXT, message TEXT, origin TEXT, created_at TIMESTAMPTZ DEFAULT NOW())`);
-    res.json({ ok: true, ts: new Date().toISOString() });
+    await pool.query(`CREATE TABLE IF NOT EXISTS merchant_configs (id SERIAL PRIMARY KEY, location_id TEXT UNIQUE NOT NULL, handypay_api_key TEXT, crm_access_token TEXT, crm_refresh_token TEXT, handypay_webhook_id TEXT, handypay_webhook_secret TEXT, deposit_percentage NUMERIC DEFAULT 30, deposit_amount NUMERIC DEFAULT 5000, updated_at TIMESTAMPTZ DEFAULT NOW())`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS payment_logs (id SERIAL PRIMARY KEY, session_id TEXT UNIQUE NOT NULL, contact_id TEXT, location_id TEXT, appointment_id TEXT, amount NUMERIC, currency TEXT DEFAULT 'jmd', status TEXT DEFAULT 'pending', access_token TEXT, payment_type TEXT DEFAULT 'deposit', checkout_url TEXT, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS short_links (id SERIAL PRIMARY KEY, code TEXT UNIQUE NOT NULL, full_url TEXT NOT NULL, session_id TEXT, location_id TEXT, contact_id TEXT, payment_type TEXT DEFAULT 'deposit', created_at TIMESTAMPTZ DEFAULT NOW())`);
+    res.json({ok:true,msg:'tables created'});
+  } catch(e) { res.status(500).json({ok:false,error:e.message}); }
+});
+
+app.get('/api/debug-token', async (req, res) => {
+  const locationId = req.query.location_id || '';
+  if (!locationId) return res.status(400).json({ error: 'location_id required' });
+  try {
+    const cfg = await getMerchantConfig(locationId);
+    if (!cfg) return res.json({ found: false });
+    const isPit = cfg.crm_access_token && !cfg.crm_refresh_token;
+    res.json({
+      found: true,
+      has_pit: isPit,
+      has_oauth: !isPit && !!cfg.crm_access_token,
+      token_prefix: cfg.crm_access_token ? cfg.crm_access_token.substring(0, 14) + '...' : null,
+      webhook_id: cfg.handypay_webhook_id || null
+    });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.all('/api/query', async (req, res) => { return res.status(404).json({ message: 'Use /api/query standalone function' }); });
-
-app.all('/api/pay', async (req, res) => {
-  var locationId=req.query.locationId||req.query.location_id||(req.body&&(req.body.locationId||req.body.location_id))||'', amountRaw=req.query.amount||(req.body&&req.body.amount)||0, amountJMD=Math.round(parseFloat(amountRaw)||0), contactId=req.query.contactId||(req.body&&req.body.contactId)||'', entityId=req.query.entityId||req.query.ghlTransactionId||(req.body&&(req.body.entityId||req.body.ghlTransactionId))||'';
-  if(!locationId) return res.status(400).json({ok:false,error:'missing locationId'});
-  var cfg=await getMerchantConfig(locationId).catch(()=>null);
-  if(!cfg||!cfg.handypay_api_key) return res.status(400).json({ok:false,error:'not_configured'});
-  try {
-    var session=await createHandyPaySession(cfg.handypay_api_key,amountJMD,'HandyPay Payment',{contact_id:contactId,location_id:locationId,entity_id:entityId,payment_type:'ghl_native'},true);
-    var sessionId=session.id, checkoutUrl=session.url||'';
-    await pool.query('INSERT INTO payment_logs (session_id,location_id,contact_id,amount,currency,status,payment_type,checkout_url) VALUES ($1,$2,$3,$4,$5,\'pending\',\'ghl_native\',$6) ON CONFLICT (session_id) DO NOTHING',[sessionId,locationId,contactId,Math.round(amountJMD),checkoutUrl]);
-    return res.json({ paymentIntentId: sessionId, checkoutUrl });
-  } catch(e) { console.error('[/api/pay]',e.message); return res.status(500).json({ok:false,error:e.message}); }
-});
-
-app.post('/api/webhooks/handypay', (req, res) => { res.status(404).json({ message: 'Use standalone function' }); });
-
-app.get('/api/debug-token', async (req, res) => {
-  const locationId=req.query.location_id||req.query.locationId||'';
-  if(!locationId) return res.status(400).json({error:'location_id required'});
-  try {
-    const cfg=await getMerchantConfig(locationId);
-    if(!cfg) return res.json({found:false});
-    res.json({found:true,has_pit:!!(cfg.crm_access_token&&!cfg.crm_refresh_token),has_oauth:!!(cfg.crm_access_token&&cfg.crm_refresh_token),token_prefix:cfg.crm_access_token?cfg.crm_access_token.substring(0,12)+'...':'none',webhook_id:cfg.handypay_webhook_id||'none'});
-  } catch(e){res.status(500).json({error:e.message});}
-});
-
-app.get('/api/debug-log', async (req, res) => {
-  const locationId=req.query.location_id||req.query.locationId||'', limit=Math.min(parseInt(req.query.limit)||20,100);
-  try {
-    const {rows}=locationId?await pool.query('SELECT * FROM debug_messages WHERE location_id=$1 ORDER BY created_at DESC LIMIT $2',[locationId,limit]):await pool.query('SELECT * FROM debug_messages ORDER BY created_at DESC LIMIT $1',[limit]);
-    res.json({count:rows.length,messages:rows});
-  } catch(e){res.status(500).json({error:e.message});}
-});
-
-app.get('/api/ghl-order', async (req, res) => {
-  const {locationId,orderId}=req.query;
-  if(!locationId||!orderId) return res.status(400).json({error:'locationId and orderId required'});
-  try { const token=await getFreshToken(locationId); const r=await fetch(GHL_API+'/payments/orders/'+orderId+'?altId='+encodeURIComponent(locationId)+'&altType=location',{headers:{'Authorization':'Bearer '+token,'Version':'2021-07-28'}}); const d=await r.json(); res.json(d); }
-  catch(e){res.status(500).json({error:e.message});}
-});
-
-app.post('/api/cron-retry', async (req, res) => {
-  const secret=req.query.secret||req.headers['x-secret']||'';
-  if(secret!==INIT_SECRET&&secret!=='handypay-init-2026-lnet') return res.status(401).json({error:'unauthorized'});
-  try {
-    const {rows}=await pool.query('SELECT pl.session_id,pl.location_id,pl.amount,pl.entity_id,pl.appointment_id FROM payment_logs pl WHERE pl.status=\'paid\' AND pl.record_payment_done=FALSE AND pl.payment_type=\'ghl_native\' AND pl.created_at>NOW()-INTERVAL \'7 days\' LIMIT 10');
-    let fixed=0;
-    for(const row of rows){
-      try { const tok=await getFreshToken(row.location_id); const invId=row.entity_id||row.appointment_id||''; if(!invId) continue; await fireRecordPayment(invId,row.location_id,row.amount,'HandyPay-cron:'+row.session_id,tok); await pool.query('UPDATE payment_logs SET record_payment_done=TRUE WHERE session_id=$1',[row.session_id]); fixed++; }
-      catch(e){console.error('[cron-retry] failed:',row.session_id,e.message);}
-    }
-    res.json({ok:true,fixed,checked:rows.length});
-  } catch(eCron){return res.status(500).json({error:eCron.message});}
-});
+app.get('*', (req, res) => { res.status(404).send('Not found'); });
 
 module.exports = app;
