@@ -1,8 +1,13 @@
 // api/webhook-hp.js — HandyPay payment webhook handler (GHL-native architecture v2)
 //
-// REMOVED: addContactTag, addContactNote, lookupContactId
-// ADDED:   updateContactFields — writes deposit_status + deposit_amount_paid to contact
-// GHL Workflow 'Deposit Confirmed' handles: tag + note + SMS + follow-up
+// deposit_status values:
+//   'pending'   — sessions created, awaiting payment
+//   'paid'      — deposit collected (balance still owed)
+//   'paid-full' — full payment collected (nothing owed)
+//   'expired'   — payment link expired before payment
+//
+// GHL Workflow 'Deposit Confirmed' (W2) triggers on 'paid' OR 'paid-full'
+// Balance Collection Reminder triggers on 'paid' only (not 'paid-full')
 //
 'use strict';
 
@@ -108,12 +113,25 @@ const handler = async function(req, res) {
   const locId         = locationId || (log && log.location_id) || '';
   const contactId     = meta.contactId || (log && log.contact_id) || '';
   const payType       = meta.paymentType || (log && log.payment_type) || 'deposit';
-  // paymentChoice covers the /api/pay path where paymentType is hardcoded 'calendar'
+  // paymentChoice covers the /api/pay path where paymentType is 'calendar'
   // but paymentChoice carries 'deposit'|'full' from the client UI selection
-  const paymentChoice = meta.paymentChoice || (log && log.payment_type) || '';
+  const paymentChoice = meta.paymentChoice || '';
   const amount        = (dataObj.amount_total || (dataObj.object && dataObj.object.amount_total))
     ? Math.round((dataObj.amount_total || dataObj.object.amount_total) / 100)
     : (log && log.amount) || 0;
+
+  // Full payment detection — covers all paths:
+  //   CRM webhook path:  payType = 'full' (set by server.js in session metadata)
+  //   /api/pay UI path:  paymentChoice = 'full' (set by create-session.js in session metadata)
+  //   DB fallback:       log.payment_type = 'full' (stored by both server.js and create-session.js)
+  const isFullPayment = payType === 'full'
+    || paymentChoice === 'full'
+    || (log && log.payment_type === 'full');
+  const depositStatus = isFullPayment ? 'paid-full' : 'paid';
+
+  console.log('[webhook-hp] payType:', payType, 'paymentChoice:', paymentChoice,
+    'logPayType:', log && log.payment_type, 'isFullPayment:', isFullPayment,
+    'depositStatus:', depositStatus, 'contactId:', contactId);
 
   // Expired session — write deposit_status=expired — triggers W4 (Link Expired) workflow
   if (isExpired) {
@@ -157,12 +175,14 @@ const handler = async function(req, res) {
   }
 
   // Write deposit_status + deposit_amount_paid — GHL Workflow fires from here
+  // deposit_status = 'paid'      → deposit only (W2 fires, Balance Reminder will fire 1 day before appt)
+  // deposit_status = 'paid-full' → full payment (W2 fires, Balance Reminder will NOT fire)
   try {
     await updateContactFields(token, locId, contactId, {
-      'contact.deposit_status':      'paid',
+      'contact.deposit_status':      depositStatus,
       'contact.deposit_amount_paid': String(amount)
     });
-    console.log('[webhook-hp] fields updated | contact:', contactId, '| JMD', amount);
+    console.log('[webhook-hp] fields updated | contact:', contactId, '| status:', depositStatus, '| JMD', amount);
   } catch (e) { console.error('[webhook-hp] updateContactFields:', e.message); }
 
   // Confirm appointment in calendar (non-blocking)
@@ -175,19 +195,7 @@ const handler = async function(req, res) {
     }).catch(e => console.warn('[webhook-hp] appt confirm:', e.message));
   }
 
-  // Tag full-payment contacts — prevents Balance Collection Reminder from incorrectly firing.
-  // isFullPayment covers two paths:
-  //   1. CRM webhook path: payType='full' (metadata.paymentType set by server.js)
-  //   2. /api/pay chooser path: paymentChoice='full' (metadata.paymentChoice set by create-session.js)
-  const isFullPayment = payType === 'full' || paymentChoice === 'full';
-  if (isFullPayment) {
-    try {
-      await addContactTag(token, contactId, ['full-payment-paid']);
-      console.log('[webhook-hp] full-payment-paid tag added | contact:', contactId);
-    } catch (e) { console.warn('[webhook-hp] full-payment-paid tag:', e.message); }
-  }
-
-  return res.json({ ok: true, mode: payType, paymentChoice, isFullPayment, amount, contactId });
+  return res.json({ ok: true, mode: depositStatus, isFullPayment, amount, contactId });
 };
 
 handler.config = { api: { bodyParser: false } };
