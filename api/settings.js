@@ -1,5 +1,6 @@
 // api/settings.js — HandyPay Settings Page v3
 // Phase 2: Added setup checklist card + deposits dashboard link
+// Phase 2b: Fixed redirect loop — render page directly after save
 'use strict';
 const { Pool } = require('pg');
 
@@ -116,7 +117,9 @@ async function handlePost(req, res, locationId) {
     }
     const finalKey = isNewHpKey ? hp_key : (existing && existing.handypay_api_key) || '';
     if (isNewHpKey && finalKey) await registerWebhook(finalKey, locationId).catch(()=>{});
-    return res.redirect(`/api/settings?location_id=${locationId}&saved=true`);
+    // Render the page directly — no redirect to avoid ERR_TOO_MANY_REDIRECTS on Vercel
+    req.query.saved = 'true';
+    return handleGet(req, res, locationId);
   } catch(e) {
     return res.status(500).send('Error: ' + e.message);
   }
