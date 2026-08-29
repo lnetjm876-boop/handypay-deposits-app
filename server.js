@@ -1,14 +1,6 @@
 const express = require('express');
 // server.js — HandyPay Deposits App (GHL-native architecture)
-// Removed in GHL-native refactor (GHL workflows handle all CRM actions):
-//   - getContact() — not needed; app only writes fields, not reads
-//   - refreshCrmToken() — replaced by lib/token.js getFreshToken()
-//   - sendSms() — GHL Workflow 1 sends all deposit SMS
-//   - addContactNote() — GHL Workflow 2 adds all notes
-//   - sendGHLPaymentCapturedWebhook() — no-op, removed
-//   - /api/webhooks/followup — GHL Workflow 3 handles deposit reminders natively
-//
-// App now does ONLY: create HP session + write 2 contact fields + GHL invoice payments
+// Phase 1: Added calendar filter — only process bookings from selected calendars
 
 const crypto = require('crypto');
 const { Pool } = require('pg');
@@ -63,8 +55,6 @@ async function addTag(accessToken, contactId, tags) {
   return r.json().catch(function() {});
 }
 
-// updateContactField: writes custom fields to contact
-// FIX: removed locationId from body (causes 422) + strip model prefix from key
 async function updateContactField(accessToken, locationId, contactId, fieldMap) {
   if (!accessToken || !contactId) return false;
   const customFields = Object.entries(fieldMap).map(([key, field_value]) => ({ key: key.replace(/^[a-z]+\./, ''), field_value: String(field_value == null ? '' : field_value) }));
@@ -176,7 +166,7 @@ app.get('/cancel', async (req, res) => {
   res.send('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Payment Cancelled</title><style>body{font-family:-apple-system,sans-serif;background:#fff7f7;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}.card{background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(0,0,0,.08);max-width:420px;width:100%;padding:40px;text-align:center}.icon{font-size:64px;margin-bottom:16px}h1{font-size:22px;font-weight:800;color:#b91c1c;margin-bottom:10px}p{font-size:15px;color:#555;line-height:1.6}</style></head><body><div class="card"><div class="icon">&#10060;</div><h1>Payment Cancelled</h1><p>Your payment was not completed.</p><p>Please use the link in your SMS to try again.</p></div><script>try{window.parent.postMessage(JSON.stringify({type:"custom_element_close_response"}),"*");}catch(e){}<\/script></body></html>');
 });
 
-// CRM WEBHOOK (GHL-native v2): no SMS, writes fields + tag, GHL workflow sends SMS
+// CRM WEBHOOK — Phase 1: calendar filter added
 app.post('/api/webhooks/crm', async (req, res) => {
   var rawBody = req.body; var body;
   try { body = typeof rawBody==='string' ? JSON.parse(rawBody) : (Buffer.isBuffer(rawBody) ? JSON.parse(rawBody.toString()) : rawBody); } catch(e) { body = rawBody; }
@@ -191,11 +181,20 @@ app.post('/api/webhooks/crm', async (req, res) => {
   if(!config) return res.json({ok:false,error:'no_config'});
   var token = config.crm_access_token;
   if(!token) return res.json({ok:false,error:'no_token'});
+  var appointmentId = body.appointmentId||(body.customData&&body.customData.appointmentId)||'';
+  var calendarId = body.calendarId||(body.customData&&body.customData.calendarId)||body.calendar_id||'';
+  // Calendar filter — only process bookings from allowed calendars
+  if (calendarId && config.allowed_calendar_ids) {
+    var allowed = config.allowed_calendar_ids.split(',').map(function(s){return s.trim();}).filter(Boolean);
+    if (allowed.length > 0 && !allowed.includes(calendarId)) {
+      console.log('[CRM Webhook] calendar', calendarId, 'not in allowed list — skipping');
+      return res.json({ok:false,error:'calendar_not_allowed',calendarId:calendarId});
+    }
+  }
   var pct = config.deposit_percentage || 30;
   var hasTotal = appointmentTotal > 0;
   var depositAmt = hasTotal ? Math.round(appointmentTotal * pct / 100) : (config.deposit_amount || 0);
   var fullAmt = appointmentTotal;
-  var appointmentId = body.appointmentId||(body.customData&&body.customData.appointmentId)||'';
   var meta = { locationId, contactId, title, startTime, appointmentId };
   var depositSession, fullSession;
   try {
@@ -215,7 +214,6 @@ app.post('/api/webhooks/crm', async (req, res) => {
     await pool.query('INSERT INTO payment_logs (session_id,contact_id,location_id,appointment_id,amount,currency,status,access_token,payment_type,checkout_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (session_id) DO NOTHING', [depositSession.id,contactId,locationId,appointmentId,depositAmt,'jmd','pending',token,'deposit',depositSession.url||null]);
     if(fullSession) await pool.query('INSERT INTO payment_logs (session_id,contact_id,location_id,appointment_id,amount,currency,status,access_token,payment_type,checkout_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (session_id) DO NOTHING', [fullSession.id,contactId,locationId,appointmentId,fullAmt,'jmd','pending',token,'full',fullSession.url||null]);
   } catch(err){ console.error('[DB]',err.message); }
-  // Write fields -> triggers GHL Workflow 'Send Deposit Link' which sends the SMS
   try {
     await updateContactField(token, locationId, contactId, { 'contact.deposit_payment_url': dLink, 'contact.deposit_status': 'pending' });
     await addTag(token, contactId, ['hp-deposit-ready']);
@@ -228,10 +226,12 @@ app.get('/api/init-db', async (req, res) => {
   const secret = req.query.secret || '';
   if(secret !== INIT_SECRET && secret !== 'handypay-init-2026-lnet') return res.status(401).json({error:'unauthorized'});
   try {
-    await pool.query(`CREATE TABLE IF NOT EXISTS merchant_configs (id SERIAL PRIMARY KEY, location_id TEXT UNIQUE NOT NULL, handypay_api_key TEXT, crm_access_token TEXT, crm_refresh_token TEXT, handypay_webhook_id TEXT, handypay_webhook_secret TEXT, deposit_percentage NUMERIC DEFAULT 30, deposit_amount NUMERIC DEFAULT 5000, updated_at TIMESTAMPTZ DEFAULT NOW())`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS merchant_configs (id SERIAL PRIMARY KEY, location_id TEXT UNIQUE NOT NULL, handypay_api_key TEXT, crm_access_token TEXT, crm_refresh_token TEXT, handypay_webhook_id TEXT, handypay_webhook_secret TEXT, deposit_percentage NUMERIC DEFAULT 30, deposit_amount NUMERIC DEFAULT 5000, deposit_type TEXT DEFAULT 'percentage', allowed_calendar_ids TEXT DEFAULT NULL, updated_at TIMESTAMPTZ DEFAULT NOW())`);
+    await pool.query(`ALTER TABLE merchant_configs ADD COLUMN IF NOT EXISTS allowed_calendar_ids TEXT DEFAULT NULL`).catch(()=>{});
+    await pool.query(`ALTER TABLE merchant_configs ADD COLUMN IF NOT EXISTS deposit_type TEXT DEFAULT 'percentage'`).catch(()=>{});
     await pool.query(`CREATE TABLE IF NOT EXISTS payment_logs (id SERIAL PRIMARY KEY, session_id TEXT UNIQUE NOT NULL, contact_id TEXT, location_id TEXT, appointment_id TEXT, amount NUMERIC, currency TEXT DEFAULT 'jmd', status TEXT DEFAULT 'pending', access_token TEXT, payment_type TEXT DEFAULT 'deposit', checkout_url TEXT, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS short_links (id SERIAL PRIMARY KEY, code TEXT UNIQUE NOT NULL, full_url TEXT NOT NULL, session_id TEXT, location_id TEXT, contact_id TEXT, payment_type TEXT DEFAULT 'deposit', created_at TIMESTAMPTZ DEFAULT NOW())`);
-    res.json({ok:true,msg:'tables created'});
+    res.json({ok:true,msg:'tables ready'});
   } catch(e) { res.status(500).json({ok:false,error:e.message}); }
 });
 
@@ -242,13 +242,7 @@ app.get('/api/debug-token', async (req, res) => {
     const cfg = await getMerchantConfig(locationId);
     if (!cfg) return res.json({ found: false });
     const isPit = cfg.crm_access_token && !cfg.crm_refresh_token;
-    res.json({
-      found: true,
-      has_pit: isPit,
-      has_oauth: !isPit && !!cfg.crm_access_token,
-      token_prefix: cfg.crm_access_token ? cfg.crm_access_token.substring(0, 14) + '...' : null,
-      webhook_id: cfg.handypay_webhook_id || null
-    });
+    res.json({ found: true, has_pit: isPit, has_oauth: !isPit && !!cfg.crm_access_token, token_prefix: cfg.crm_access_token ? cfg.crm_access_token.substring(0, 14) + '...' : null, webhook_id: cfg.handypay_webhook_id || null, allowed_calendar_ids: cfg.allowed_calendar_ids || null });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
